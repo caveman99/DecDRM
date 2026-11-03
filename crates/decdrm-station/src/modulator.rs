@@ -333,6 +333,10 @@ impl Modulator {
     fn job(&mut self, f: &MdiFrame, fac: Fac, frame_index: usize) -> Result<Job, String> {
         let sdci = f.sdci.as_ref().ok_or("no sdci item")?;
         let ch = fac.channel;
+        if ch.mode_e {
+            // ponytail: DRM30 MDI only; DRM+ needs 100 ms MDI frames and their FAC.
+            return Err("the MDI carries a DRM+ (mode E) multiplex, which the modulator does not transmit".into());
+        }
         let mode = match f.robustness {
             Some(m) => RobustnessMode::ALL[usize::from(m.min(3))],
             None => self.current.map(|(c, _)| c.mode).ok_or("no robm item")?,

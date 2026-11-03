@@ -13,8 +13,8 @@ use crate::fec::crc::Crc;
 use crate::fec::mlc::{MlcDecoder, MlcParams, MscProtection};
 use crate::fec::qam::EqCell;
 use super::mscdec::MscDecoder;
-use crate::params::{FRAMES_PER_SUPERFRAME, RobustnessMode, SAMPLE_RATE, SpectrumOccupancy};
-use crate::tables::NUM_FAC_CELLS;
+use crate::params::{RobustnessMode, SpectrumOccupancy};
+use crate::tables::num_fac_cells;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -29,8 +29,8 @@ pub struct SdcBlock {
     pub crc_ok: bool,
 }
 
-/// One decoded multiplex frame: the MSC bit stream of 400 ms, ready for
-/// demultiplexing with the SDC multiplex description.
+/// One decoded multiplex frame: the MSC bit stream of 400 ms (mode E: 100 ms), ready
+/// for demultiplexing with the SDC multiplex description.
 #[derive(Debug, Clone)]
 pub struct MscFrame {
     /// Very strongly protected part (hierarchical modulation only), bits.
@@ -44,6 +44,11 @@ pub struct MscFrame {
     /// False while the long cell interleaver is still filling after a (re)start:
     /// part of the cells were erasures, so decoded content is unreliable.
     pub complete: bool,
+    /// Index within its transmission super frame of the frame this multiplex frame
+    /// went out with (the interleaver delay taken into account), when known. In mode E
+    /// an even index carries the first half of an audio super frame (§5.2, §6.3.3
+    /// toggle flag).
+    pub position: Option<usize>,
 }
 
 /// Plot data captured from the symbol chain (cheap to clone on demand).
@@ -167,8 +172,8 @@ pub(super) struct SymbolChain {
     /// MSC cells before each super-frame symbol (position of its first MSC cell).
     msc_offset: Vec<usize>,
     /// Carrier offset (`k − kmin`) of each MSC cell of the multiplex frames at
-    /// positions 0, 1, 2 of the super frame (diversity branches hand them out).
-    frame_carriers: [Arc<[u16]>; FRAMES_PER_SUPERFRAME],
+    /// positions 0, 1, 2 (, 3) of the super frame (diversity branches hand them out).
+    frame_carriers: Vec<Arc<[u16]>>,
     /// Collecting a multiplex frame that started at a frame boundary.
     msc_collecting: bool,
     /// Frames were lost: restart the cell deinterleaver before the next frame.
@@ -197,10 +202,10 @@ impl SymbolChain {
     pub fn new(mode: RobustnessMode, so: SpectrumOccupancy, cfg: &ReceiverConfig) -> Option<Self> {
         let map = Arc::new(CellMap::new(mode, so)?);
         let last_fac_symbol = crate::tables::fac_positions(mode).iter().map(|&(s, _)| s as usize).max().unwrap_or(0);
-        let mut fac_dec = MlcDecoder::new(MlcParams::fac(), 0);
+        let mut fac_dec = MlcDecoder::new(MlcParams::fac(mode), 0);
         fac_dec.metric = cfg.metric;
-        let sdc_mode = SdcMode::Qam16;
-        let mut sdc_dec = MlcDecoder::new(MlcParams::sdc(sdc_mode.mapping(), map.sdc_cells_per_superframe), 1);
+        let sdc_mode = if mode.is_drm_plus() { SdcMode::Qam4 } else { SdcMode::Qam16 };
+        let mut sdc_dec = MlcDecoder::new(sdc_mode.mlc_params(map.sdc_cells_per_superframe), 1);
         sdc_dec.metric = cfg.metric;
         Some(Self {
             ofdm: OfdmDemod::new(&map),
@@ -216,7 +221,7 @@ impl SymbolChain {
             seek_sdc: false,
             sdc_found: false,
             sdc_misses: 0,
-            fac_cells: Vec::with_capacity(NUM_FAC_CELLS),
+            fac_cells: Vec::with_capacity(num_fac_cells(mode)),
             last_fac_symbol,
             fac_dec,
             sdc_mode,
@@ -316,11 +321,10 @@ impl SymbolChain {
             self.msc_gap = true;
             self.sf_synced = false;
             self.msc = None;
-            self.sdc_mode = SdcMode::Qam4; // force SDC decoder rebuild below
         }
         if fac.channel.sdc_mode != self.sdc_mode || self.sdc_dec.params().cells != self.map.sdc_cells_per_superframe {
             self.sdc_mode = fac.channel.sdc_mode;
-            let mut d = MlcDecoder::new(MlcParams::sdc(self.sdc_mode.mapping(), self.map.sdc_cells_per_superframe), 1);
+            let mut d = MlcDecoder::new(self.sdc_mode.mlc_params(self.map.sdc_cells_per_superframe), 1);
             d.metric = cfg.metric;
             self.sdc_dec = d;
         }
@@ -337,8 +341,9 @@ impl SymbolChain {
                 self.chanest.msc_mapping = Some(c.mode.mapping());
                 // A diversity branch only needs the mapping (for its MER); the
                 // combiner decodes.
-                self.msc = (!self.cells_out)
-                    .then(|| MscDecoder::new(c, self.map.msc_cells_per_frame, self.msc_iterations, metric));
+                self.msc = (!self.cells_out).then(|| {
+                    MscDecoder::new(c, self.map.mode(), self.map.msc_cells_per_frame, self.msc_iterations, metric)
+                });
             }
         }
     }
@@ -355,7 +360,7 @@ impl SymbolChain {
         };
         let mut cells = std::mem::take(&mut self.cells);
         self.ofdm.demodulate(&win.samples, &mut cells);
-        let fs = self.frame.process(&cells, win.shift);
+        let fs = self.frame.process(&cells, win.shift, win.guard_phasor, self.ofdm.spectrum());
         out.sro_estimate = fs.sro_estimate;
         out.alignment_lost = fs.alignment_lost;
         // Track frequency from the start: the pilots are there in every symbol.
@@ -430,7 +435,7 @@ impl SymbolChain {
         // Frame within the super frame (unknown before the first FAC: assume a frame
         // without SDC so MSC cells are still plotted).
         let frame = match self.frame_id {
-            Some(f) if s == 0 => (f + 1) % FRAMES_PER_SUPERFRAME,
+            Some(f) if s == 0 => (f + 1) % map.frames_per_superframe(),
             Some(f) => f,
             None => 1,
         };
@@ -443,7 +448,7 @@ impl SymbolChain {
         for &c in map.msc_carriers(sf_sym) {
             self.vis_msc.push_back(cells[c as usize].sig);
         }
-        keep_last(&mut self.vis_fac, NUM_FAC_CELLS);
+        keep_last(&mut self.vis_fac, num_fac_cells(map.mode()));
         keep_last(&mut self.vis_sdc, map.sdc_cells_per_superframe);
         keep_last(&mut self.vis_msc, map.msc_cells_per_frame);
         let mut row = if self.chan_rows.len() >= CHAN_ROWS {
@@ -476,7 +481,7 @@ impl SymbolChain {
         v.msc = self.vis_msc.iter().copied().collect();
         v.chan_rows = self.chan_rows.iter().cloned().collect();
         v.chan_seq = self.chan_seq;
-        v.symbol_s = self.map.mode().symbol_len() as Real / Real::from(SAMPLE_RATE);
+        v.symbol_s = self.map.mode().symbol_len() as Real / Real::from(self.map.mode().sample_rate());
         let (pds, axis) = self.chanest.power_delay_profile();
         v.pds = pds;
         v.pds_axis = Some(axis);
@@ -497,7 +502,7 @@ impl SymbolChain {
             self.fac_cells.push(cells[c as usize]);
         }
         if s == self.last_fac_symbol {
-            if self.fac_cells.len() == NUM_FAC_CELLS {
+            if self.fac_cells.len() == num_fac_cells(map.mode()) {
                 let mut bits = Vec::new();
                 self.fac_dec.decode(&self.fac_cells, &mut bits);
                 match Fac::parse(&bits) {
@@ -516,7 +521,7 @@ impl SymbolChain {
         if s == 0
             && let Some(f) = self.frame_id.as_mut()
         {
-            *f = (*f + 1) % FRAMES_PER_SUPERFRAME;
+            *f = (*f + 1) % map.frames_per_superframe();
         }
         let Some(mut f) = self.frame_id else { return };
 
@@ -569,11 +574,12 @@ impl SymbolChain {
             return;
         }
 
-        // The MSC cells of a super frame form three multiplex frames of N_MUX cells
-        // followed by 0..=2 dummy cells. Collection may start at any multiplex-frame
-        // boundary, so audio can begin up to a super frame earlier after sync.
+        // The MSC cells of a super frame form three (mode E: four) multiplex frames of
+        // N_MUX cells followed by 0..=2 dummy cells. Collection may start at any
+        // multiplex-frame boundary, so audio can begin up to a super frame earlier after
+        // sync.
         let n_mux = map.msc_cells_per_frame;
-        let useful = 3 * n_mux;
+        let useful = map.frames_per_superframe() * n_mux;
         let first = self.msc_offset[sf_sym];
         for (pos, &c) in (first..).zip(map.msc_carriers(sf_sym)) {
             if pos < useful {
@@ -594,7 +600,7 @@ impl SymbolChain {
                             let index = pos / n_mux;
                             let carriers = Arc::clone(&self.frame_carriers[index]);
                             events.push(ChainEvent::MscCells { cells: frame, index, gap, carriers, kmin: map.kmin });
-                        } else if let Some(m) = self.decode_msc(frame) {
+                        } else if let Some(m) = self.decode_msc(frame, pos / n_mux) {
                             events.push(ChainEvent::Msc(m));
                         }
                     }
@@ -687,9 +693,10 @@ impl SymbolChain {
         SdcBlock { afs_index, data, crc_ok: crc.value() == rx_crc }
     }
 
-    fn decode_msc(&mut self, frame: Vec<EqCell>) -> Option<MscFrame> {
+    /// Decode the multiplex frame mapped at position `index` of the super frame.
+    fn decode_msc(&mut self, frame: Vec<EqCell>, index: usize) -> Option<MscFrame> {
         let gap = std::mem::replace(&mut self.msc_gap, false);
-        self.msc.as_mut()?.decode(&frame, gap)
+        self.msc.as_mut()?.decode(&frame, gap, Some(index))
     }
 }
 
@@ -707,15 +714,17 @@ fn msc_offsets(map: &CellMap) -> Vec<usize> {
 
 /// The carrier offsets of the MSC cells of each multiplex frame of a super frame, in
 /// transmission order (the frames' cells follow `msc_carriers` symbol by symbol).
-fn msc_frame_carriers(map: &CellMap) -> [Arc<[u16]>; FRAMES_PER_SUPERFRAME] {
+fn msc_frame_carriers(map: &CellMap) -> Vec<Arc<[u16]>> {
     let n = map.msc_cells_per_frame.max(1);
-    let mut frames: [Vec<u16>; FRAMES_PER_SUPERFRAME] = Default::default();
+    let count = map.frames_per_superframe();
+    let mut frames = vec![Vec::new(); count];
     let carriers = (0..map.symbols_per_superframe).flat_map(|sym| map.msc_carriers(sym).iter().copied());
-    for (pos, c) in carriers.take(FRAMES_PER_SUPERFRAME * n).enumerate() {
+    for (pos, c) in carriers.take(count * n).enumerate() {
         frames[pos / n].push(c);
     }
-    frames.map(Arc::from)
+    frames.into_iter().map(Arc::from).collect()
 }
+
 
 fn track_reset(chanest: &mut ChannelEstimator) {
     // Tracking outputs are one-shot increments.

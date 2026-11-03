@@ -39,7 +39,7 @@ use super::chain::{MscConfig, MscFrame};
 use super::mscdec::MscDecoder;
 use super::{Receiver, ReceiverConfig, ReceiverEvent};
 use crate::fec::qam::{EqCell, Mapping, MetricKind};
-use crate::params::{SAMPLE_RATE, SAMPLES_PER_FRAME};
+use crate::params::RobustnessMode;
 use crate::{Cplx, Real};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -112,8 +112,9 @@ pub struct DiversityStats {
     pub last_from: [bool; 2],
 }
 
-/// Duration of a multiplex frame, seconds.
-const FRAME_S: Real = SAMPLES_PER_FRAME as Real / SAMPLE_RATE as Real;
+/// Duration of a DRM30 multiplex frame, seconds (the tests' time base).
+#[cfg(test)]
+const FRAME_S: Real = 0.4;
 /// Frames a branch may lag the other: a frame waits that long for its partner, and a
 /// branch further behind is taken as absent.
 pub const MAX_LAG: i64 = 8;
@@ -141,6 +142,8 @@ struct Frame {
 #[derive(Debug)]
 struct Ready {
     cells: Vec<EqCell>,
+    /// Position of the frame in its super frame.
+    index: usize,
     from: [bool; 2],
     gap: bool,
     /// Branch 0's share of the weight (combined frames).
@@ -150,6 +153,11 @@ struct Ready {
 /// The pairing, combining and decoding of two branches' frames.
 pub(crate) struct Combiner {
     config: Option<MscConfig>,
+    /// Robustness mode family (B stands for DRM30, E for DRM+): the frame duration
+    /// and the frames per super frame that frame numbers count with.
+    mode: RobustnessMode,
+    frame_s: Real,
+    period: usize,
     iterations: usize,
     metric: MetricKind,
     decoder: Option<MscDecoder>,
@@ -184,9 +192,12 @@ pub(crate) struct Combiner {
 }
 
 impl Combiner {
-    pub fn new(iterations: usize, metric: MetricKind) -> Self {
+    pub fn new(mode: RobustnessMode, iterations: usize, metric: MetricKind) -> Self {
         Self {
             config: None,
+            mode,
+            frame_s: mode.frame_duration_s(),
+            period: mode.frames_per_superframe(),
             iterations,
             metric,
             decoder: None,
@@ -219,7 +230,7 @@ impl Combiner {
     pub fn reset(&mut self) {
         let (config, iterations, metric, stats) = (self.config, self.iterations, self.metric, self.stats);
         let (mix, mix_seq) = (std::mem::take(&mut self.mix), self.mix_seq);
-        *self = Self::new(iterations, metric);
+        *self = Self::new(self.mode, iterations, metric);
         self.config = config;
         self.stats = DiversityStats { lead_frames: None, agreement: None, share: None, ..stats };
         (self.mix, self.mix_seq) = (mix, mix_seq);
@@ -296,7 +307,7 @@ impl Combiner {
                     self.mismatches = 0;
                     let earlier: Vec<Frame> = self.unplaced[b].drain(..).collect();
                     for e in earlier {
-                        let ne = snap(n as Real + (e.time_s - frame.time_s) / FRAME_S, e.index);
+                        let ne = snap(n as Real + (e.time_s - frame.time_s) / self.frame_s, e.index, self.period);
                         self.place(b, e, ne);
                     }
                     self.place(b, frame, n);
@@ -321,7 +332,7 @@ impl Combiner {
                 return;
             }
             let m = self.newest[b].unwrap_or(n);
-            let n = m + 1 + (frame.index as i64 - (m + 1)).rem_euclid(3);
+            let n = m + 1 + (frame.index as i64 - (m + 1)).rem_euclid(self.period as i64);
             self.gap = true;
             self.anchor[b] = None;
             self.place(b, frame, n);
@@ -335,7 +346,7 @@ impl Combiner {
                 self.mismatches = 0;
                 let waiting: Vec<Frame> = self.unplaced[o].drain(..).collect();
                 for f in waiting {
-                    let nf = snap(n as Real + (f.time_s - t_match) / FRAME_S, f.index);
+                    let nf = snap(n as Real + (f.time_s - t_match) / self.frame_s, f.index, self.period);
                     self.place(o, f, nf);
                 }
             }
@@ -347,7 +358,7 @@ impl Combiner {
     /// since, in frames; `None` while the branch is not anchored.
     fn number(&self, b: usize, frame: &Frame) -> Option<i64> {
         let (n, t) = self.anchor[b]?;
-        Some(snap(n as Real + (frame.time_s - t) / FRAME_S, frame.index))
+        Some(snap(n as Real + (frame.time_s - t) / self.frame_s, frame.index, self.period))
     }
 
     /// Put frame number `n` of branch `b` into its slot; check a new pair by content.
@@ -441,6 +452,7 @@ impl Combiner {
                 (None, None) => {}
             }
             let mapping = self.config.map_or(Mapping::Qam16, |c| c.mode.mapping());
+            let index = n.rem_euclid(self.period as i64) as usize;
             out.push(match slot {
                 [Some(x), Some(y)] => {
                     let m = combine(&x.cells, &y.cells, mapping);
@@ -449,17 +461,17 @@ impl Combiner {
                     if let Some(c) = carrier_mix(&x, &y, m.ka, m.kb) {
                         self.carrier_mix = Some(c);
                     }
-                    Ready { cells: m.cells, from: [true, true], gap, share: Some(m.share) }
+                    Ready { cells: m.cells, index, from: [true, true], gap, share: Some(m.share) }
                 }
                 [Some(x), None] => {
                     let snr = mean_weight(&x.cells);
                     self.record([true, false], [Some(snr), None], Some(snr), None);
-                    Ready { cells: x.cells, from: [true, false], gap, share: None }
+                    Ready { cells: x.cells, index, from: [true, false], gap, share: None }
                 }
                 [None, Some(y)] => {
                     let snr = mean_weight(&y.cells);
                     self.record([false, true], [None, Some(snr)], Some(snr), None);
-                    Ready { cells: y.cells, from: [false, true], gap, share: None }
+                    Ready { cells: y.cells, index, from: [false, true], gap, share: None }
                 }
                 [None, None] => continue,
             });
@@ -477,10 +489,10 @@ impl Combiner {
         let cfg = self.config?;
         let mut gap = r.gap;
         if self.decoder.as_ref().is_none_or(|d| d.config() != cfg || d.cells() != r.cells.len()) {
-            self.decoder = Some(MscDecoder::new(cfg, r.cells.len(), self.iterations, self.metric));
+            self.decoder = Some(MscDecoder::new(cfg, self.mode, r.cells.len(), self.iterations, self.metric));
             gap = true;
         }
-        self.decoder.as_mut()?.decode(&r.cells, gap)
+        self.decoder.as_mut()?.decode(&r.cells, gap, Some(r.index))
     }
 }
 
@@ -574,9 +586,9 @@ fn mrc(a: &[EqCell], b: &[EqCell], ka: Real, kb: Real) -> Vec<EqCell> {
 
 /// The frame number nearest to `x` at position `index` of its super frame (three
 /// numbers per super frame).
-fn snap(x: Real, index: usize) -> i64 {
-    let i = index as i64;
-    3 * ((x - i as Real) / 3.0).round() as i64 + i
+fn snap(x: Real, index: usize, period: usize) -> i64 {
+    let (i, p) = (index as i64, period as i64);
+    p * ((x - i as Real) / p as Real).round() as i64 + i
 }
 
 /// Fraction of cells with the same hard decision.
@@ -624,11 +636,12 @@ impl DiversityReceiver {
     /// format); the MSC decoder takes the first's iterations and metric.
     pub fn new(cfg: [ReceiverConfig; 2]) -> Self {
         let (iterations, metric) = (cfg[0].msc_iterations, cfg[0].metric);
-        let branches = cfg.map(|c| Receiver::new(ReceiverConfig { diversity_branch: true, ..c }));
-        Self { branches, combiner: Combiner::new(iterations, metric) }
+        let mode = if cfg[0].drm_plus { RobustnessMode::E } else { RobustnessMode::B };
+        let branches = cfg.map(|c| Receiver::new(ReceiverConfig { diversity_branch: true, drm_plus: mode.is_drm_plus(), ..c }));
+        Self { branches, combiner: Combiner::new(mode, iterations, metric) }
     }
 
-    /// Feed branch `branch` (0 or 1) interleaved 48 kHz frames. Returns its events
+    /// Feed branch `branch` (0 or 1) interleaved frames at the working rate. Returns its events
     /// (synchronisation, FAC, SDC) and the multiplex frames the combiner could decode
     /// ([`ReceiverEvent::Msc`]).
     pub fn push(&mut self, branch: usize, frames: &[f32]) -> Vec<ReceiverEvent> {
@@ -726,7 +739,7 @@ mod tests {
     }
 
     fn combiner() -> Combiner {
-        Combiner::new(1, MetricKind::default())
+        Combiner::new(RobustnessMode::B, 1, MetricKind::default())
     }
 
     fn feed(c: &mut Combiner, b: usize, f: MscCells) -> Vec<Ready> {
@@ -919,12 +932,12 @@ mod tests {
 
     #[test]
     fn frame_numbers_follow_the_super_frame() {
-        assert_eq!((snap(0.0, 0), snap(1.02, 1), snap(1.97, 2)), (0, 1, 2));
+        assert_eq!((snap(0.0, 0, 3), snap(1.02, 1, 3), snap(1.97, 2, 3)), (0, 1, 2));
         // Up to one and a half frames early or late still gives the same number.
-        assert_eq!((snap(3.4, 0), snap(2.6, 0), snap(4.4, 0), snap(1.6, 0)), (3, 3, 3, 3));
+        assert_eq!((snap(3.4, 0, 3), snap(2.6, 0, 3), snap(4.4, 0, 3), snap(1.6, 0, 3)), (3, 3, 3, 3));
         // The position decides between neighbours.
-        assert_eq!((snap(3.0, 1), snap(3.0, 2)), (4, 2));
-        assert_eq!((snap(-1.0, 2), snap(-2.9, 0)), (-1, -3));
+        assert_eq!((snap(3.0, 1, 3), snap(3.0, 2, 3)), (4, 2));
+        assert_eq!((snap(-1.0, 2, 3), snap(-2.9, 0, 3)), (-1, -3));
         assert!(threshold(16, 2000) < 0.1 && threshold(4, 2000) > 0.25);
     }
 

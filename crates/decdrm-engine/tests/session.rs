@@ -47,7 +47,7 @@ fn run_selecting(file: &str, seconds: f64, input: InputFormat, select: Option<u8
         eprintln!("skipping: {} not found", path.display());
         return None;
     }
-    let mut source = Source::open(&InputSpec::File { path, realtime: false }).expect("open recording");
+    let mut source = Source::open(&InputSpec::File { path, realtime: false }, decdrm_core::params::SAMPLE_RATE).expect("open recording");
     let ch = source.info().channels;
     let cfg = ReceiverConfig { input, channels: ch, ..Default::default() };
     let mut session = Session::new(cfg);

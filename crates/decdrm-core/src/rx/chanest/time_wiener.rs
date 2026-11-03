@@ -6,7 +6,7 @@
 
 use crate::cellmap::CellMap;
 use crate::dsp::{iir1_c, iir1_lambda, levinson, linear_regression_slope};
-use crate::params::{RobustnessMode, SAMPLE_RATE};
+use crate::params::RobustnessMode;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 use std::f64::consts::PI;
@@ -24,6 +24,9 @@ fn params(mode: RobustnessMode) -> (usize, Real) {
         RobustnessMode::B => (7, 2.7 / 2.0),
         RobustnessMode::C => (9, 5.7 / 2.0),
         RobustnessMode::D => (9, 4.5 / 2.0),
+        // Mode E: gain references every 10 ms per grid carrier (Nyquist ±50 Hz); a
+        // classical Doppler spectrum at 150 km/h in band III (f_D ≈ 28 Hz) has σ ≈ 20 Hz.
+        RobustnessMode::E => (9, 20.0),
     }
 }
 
@@ -67,7 +70,7 @@ impl TimeWiener {
         let (len, sigma_max) = params(mode);
         let t = map.scattered.time_int;
         let delay = ((len * t - t + 1) as Real / 2.0).ceil() as usize + t / 2 - 1;
-        let ts = mode.symbol_len() as Real / Real::from(SAMPLE_RATE);
+        let ts = mode.symbol_len() as Real / Real::from(mode.sample_rate());
         let grid_len = (map.num_carriers - 1) / map.scattered.freq_int + 1;
         let s0 = (0..map.symbols_per_frame).find(|&s| map.cell(s, 0).is_scattered()).unwrap_or(0);
         let num_pil_one_sym = grid_len.div_ceil(t);

@@ -437,11 +437,16 @@ pub struct To48k {
 impl To48k {
     /// Creates a converter for `channels`-channel input at `in_rate` Hz.
     pub fn new(in_rate: u32, channels: usize) -> Result<Self> {
+        Self::to_rate(in_rate, channels, WORKING_RATE)
+    }
+
+    /// A converter to `out_rate` instead of 48 kHz (DRM+ runs at 192 kHz).
+    pub fn to_rate(in_rate: u32, channels: usize, out_rate: u32) -> Result<Self> {
         AudioFormat::new(in_rate, channels).validate()?;
-        let inner = if in_rate == WORKING_RATE {
+        let inner = if in_rate == out_rate {
             None
         } else {
-            Some(Resampler::to_48k(in_rate, channels)?)
+            Some(Resampler::new(in_rate, out_rate, channels, ResamplerQuality::High)?)
         };
         Ok(To48k { inner, channels })
     }

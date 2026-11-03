@@ -1,6 +1,6 @@
 # DecDRM — design
 
-DecDRM is a Digital Radio Mondiale (DRM30) receiver **and** transmitter written in Rust.
+DecDRM is a Digital Radio Mondiale (DRM30 and DRM+) receiver **and** transmitter written in Rust.
 This document records the decisions from the kickoff Q&A (2026-09-29), the architecture,
 and the milestone plan. Keep the milestone checklist current.
 
@@ -8,7 +8,7 @@ and the milestone plan. Keep the milestone checklist current.
 
 | Topic | Decision |
 |---|---|
-| Standard scope | DRM30 robustness modes **A, B, C, D**; all spectrum occupancies (0–5, 4.5–20 kHz); 4/16/64-QAM; SM, HMsym, HMmix; short & long interleaving; all protection levels. No DRM+ (mode E), no analog AM/SSB/FM, no AMSS. |
+| Standard scope | DRM30 robustness modes **A, B, C, D**; all spectrum occupancies (0–5, 4.5–20 kHz); 4/16/64-QAM; SM, HMsym, HMmix; short & long interleaving; all protection levels. Since 2026-11-03 (the user's request) also **DRM+ (robustness mode E**, 100 kHz, VHF), receiver and transmitter, at 192 kHz (see the milestone *DRM+*). No analog AM/SSB/FM, no AMSS. |
 | Purpose | Personal / hobby. |
 | Relationship to Dream | Spec-first idiomatic Rust, freely translating Dream's proven algorithms (sync, Wiener channel estimation, MLC decoding). Licence therefore **GPL-2.0-or-later**. Reference: Dream `branches/dream-mjf` r1548. |
 | Receiver performance | Match or beat Dream on weak/fading signals (Wiener channel estimation, soft-decision Viterbi, iterative MLC, sample-rate-offset tracking). |
@@ -383,7 +383,79 @@ symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
       the tree, then the changed pages with revision 1 and the new page). Checked
       by hand: `decdrm tx` with feeds from a local server, `jmldump` of its output
       shows the recording's layout.
+- [x] **DRM+ (robustness mode E)** (2026-11-03) — the user asked for a DRM+ encoder and
+      decoder, specs first. Written from ES 201 980 V4.2.1 (2021-01), which has mode E
+      throughout (no Dream code: the r1548 checkout here has none of it).
+      *Numerology:* Tu 2.25 ms, Tg 0.25 ms, 40 symbols per 100 ms frame, four frames per
+      400 ms super frame, carriers −106..106 (213, the DC carrier used), 4444/9 Hz
+      spacing (table 47, 49). DecDRM runs it at 192 kHz (`DRM_PLUS_SAMPLE_RATE`;
+      `RobustnessMode::sample_rate`), where Tu is 432 and Tg 48 samples and a frame is
+      19 200 samples, as at 48 kHz in modes A–D, so `SAMPLES_PER_FRAME` stays.
+      *Cells:* no frequency references; 21 time references (table 57); gain references
+      k = 2 + 4·(s mod 4) + 16p with mode E's own phase formula p²R + pZ + Q (§8.4.4.3.6),
+      ±102/±106 boosted; AFS references (table 61: 54 cells of power 1 in symbol 4 of
+      the first and 39 of the fourth frame, 13 of them gain references — the test checks
+      that their phases agree with the formula, which checks both transcriptions); 244
+      FAC cells in symbols 5–26 (table 66, built by a const fn); SDC in symbols 0–4.
+      Counts as tables 25/45: N_SDC 936, N_MUX 7460, two dummy cells.
+      *Coding:* the mother code is rate 1/6 (b₃–b₅ repeat b₀–b₂; the Viterbi decoder
+      adds their metrics); new rates 1/6 and 2/5 appended to `CODE_RATES`; MSC 4-QAM
+      0.25/0.33/0.4/0.5 and 16-QAM 0.33/0.41/0.5/0.62 (tables 29, 31); SDC 4-QAM 0.5 or
+      0.25 (`SdcMode::Qam4Robust`); FAC 4-QAM 0.25, 116 bits (two sets of service
+      parameters, CRC over 112 bits with four zero bits); the cell interleaver's depth 6
+      (600 ms). Block sizes agree with annex J (J.5: 9938 … 7454 bits, J.10: 930/465).
+      *FAC:* the RM flag selects mode E's meanings of occupancy, MSC/SDC mode and
+      interleaving; identity 01 twice, told apart by the toggle flag (set in frames 1
+      and 3). The ensemble takes both service sets; the station's FAC scheduler sends
+      table 20's two-set patterns (one service: twice).
+      *Receiver* (`ReceiverConfig::drm_plus`, input at 192 kHz): no frequency search —
+      the DC carrier starts at 0 Hz (I/Q) or 48 kHz (real IF). Time sync correlates the
+      guard at full rate (no decimation, a step of 2 samples, no mode detection).
+      Frequency tracking uses the phase of the cyclic-prefix correlation
+      (`SymbolWindow::guard_phasor`, ±222 Hz), and the frame sync first finds the
+      whole-carrier offset together with the time reference symbol: the adjacent time
+      reference pairs correlated with the whole FFT output at every offset within ±100
+      carriers (±44 kHz), the best (symbol, offset) of a frame confirmed a frame later.
+      Acquisition time-outs scale to 4 s of mode E symbols and frames. The time Wiener
+      filter allows σ up to 20 Hz (pilots every 10 ms per grid carrier).
+      `MscFrame::position` gives the frame each decoded multiplex frame went out with
+      (the interleaver delay counted), which tells the halves of mode E's audio super
+      frames apart.
+      *Multiplex and audio:* 100 ms logical frames; an audio super frame (200 ms) spans
+      two of them, the first starting at an even frame (§5.2, toggle flag); each logical
+      frame carries its own four text bytes (§6.5, 320 bit/s). AAC 24 kHz (5 frames) or
+      48 kHz without SBR (10), HE-AAC/v2 at a 24 kHz core; xHE-AAC with 200 ms super
+      frames (`XheAacConfig::super_frame_ms`: 40 bit/s per byte, ⌊0.2·fs/F⌋ frames,
+      48 kHz without SBR now possible); Dream's Opus with 10 packets.
+      *Station:* `mode = "E"` in the TOML (occupancy 0, "4-QAM"/"16-QAM" MSC,
+      "4-QAM"/"4-QAM-robust" SDC, long interleaving, protection 0–3) and checks for
+      everything mode E lacks; streams per 100 ms, audio encoded per 200 ms and sent
+      half by half; 192 kHz file and sound-card output (the transmit filter scaled to
+      keep its length); `[simulate]` and `--channel-model` take the annex B.2 DRM+
+      channels 7–12 (band II; classical Doppler simulated as Gaussian of the same RMS
+      spread, Gauss1/2 as their main lobes). Example `examples/drm_plus.toml`.
+      *Apps:* `decdrm rx --drm-plus`; the GUI's source bar has a *DRM+* switch; the
+      transmitter form offers mode E with its bandwidth, constellations and code
+      rates; durations, bit rates and spectra follow the 100 ms frames and 192 kHz.
+      *Tests:* table/cell-map/FAC/MLC/TX unit tests for mode E;
+      `decdrm-core/tests/drm_plus.rs` (receiver loopback: all constellations and SDC
+      modes clean; I/Q offsets +5 kHz, −20 kHz + 170 Hz, −60 Hz; real IF at 48 kHz +
+      300 Hz — every FAC, SDC and multiplex frame after the first FAC at 0.5 s,
+      bit-exact and at its position; AWGN 3 dB above annex A's C/N (4-QAM R 1/3 at
+      4.3 dB, 16-QAM R 1/2 at 10.9 dB): no frame lost; ignored: channels 8–12 at 16 dB,
+      4-QAM R 1/3, no wrong frame, 76–89 % of the frames); `decdrm-station/tests/
+      drm_plus.rs` (AAC 48 kHz + text + slideshow, HE-AAC stereo with the robust SDC,
+      xHE-AAC, Opus: decoded without a concealed frame, the tone, the texts, the slide
+      byte for byte); the CI smoke test transmits and receives the example.
+      `decdrm rx` decodes the 192 kHz signal at ~6× real time here.
+      *Not done:* MDI/RSCI for DRM+ (the modulator rejects a mode E MDI); DAC in mode E
+      (its framing is built for 400 ms); KiwiSDRs (12 kHz wide) cannot carry it; the
+      pilot-slope SRO acquisition (needs continuous pilots; the impulse-response
+      tracking still corrects clock offsets once locked); AFS cells only as known
+      cells, not in the channel estimate; diversity reception follows mode E's frame
+      timing but is untested.
 - [x] **Corrupt xHE-AAC frames concealed; Smooth SBR** (2026-10-07) — from the overnight
+
       CNR survey (2026-10-06/07: 6030 and 13835 kHz on Korean, Japanese and Taiwanese
       Kiwis, decoded by FDK-AAC and an instrumented libxaac). (1) The session handed
       xHE-AAC frames whose CRC-16 failed to FDK-AAC, which does not check it, and counted

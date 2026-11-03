@@ -487,6 +487,7 @@ fn multiplex_loopback() {
     let streams = [StreamLengths { part_a: 40, part_b: 380 }, StreamLengths { part_a: 0, part_b: 4 * 48 }];
     let mut mux = MultiplexDescription::new_hierarchical(0, 1, 2, 0, &streams);
     let params = MlcParams::msc(
+        crate::params::RobustnessMode::B,
         MscMode::Qam64HmSym.mapping(),
         map.msc_cells_per_frame,
         mux.protection(true),
@@ -520,6 +521,7 @@ fn multiplex_loopback() {
     let fac = |short_id: u8, is_data: bool| Fac {
         channel: ChannelParams {
             enhancement: false,
+            mode_e: false,
             frame_index: 0,
             afs_valid: false,
             occupancy: SpectrumOccupancy::SO_3,
@@ -540,6 +542,7 @@ fn multiplex_loopback() {
             descriptor: 2,
             data_ca: false,
         },
+        service2: None,
     };
     ens.update_fac(&fac(0, false));
     ens.update_fac(&fac(1, true));

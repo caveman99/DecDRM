@@ -24,9 +24,9 @@ pub struct TxArgs {
     /// Only check the configuration and print the multiplex.
     #[arg(long)]
     check: bool,
-    /// Pass the signal through DRM channel model 1-6 (ES 201 980 annex B) before the
-    /// outputs, overriding the file's [simulate] section.
-    #[arg(long, value_name = "1-6")]
+    /// Pass the signal through DRM channel model 1-6 (ES 201 980 annex B; DRM+: 7-12)
+    /// before the outputs, overriding the file's [simulate] section.
+    #[arg(long, value_name = "1-12")]
     channel_model: Option<u8>,
     /// Add white noise for this SNR (dB, in the nominal channel bandwidth); implies
     /// channel model 1 (AWGN) unless one is set.
@@ -60,7 +60,7 @@ pub fn run(a: TxArgs) -> Result<()> {
     {
         bail!("--duration must be a positive number of seconds");
     }
-    let frames = a.duration.map(|d| (d / 0.4).ceil() as u64);
+    let frames = a.duration.map(|d| (d / plan.frame_seconds()).ceil() as u64);
 
     // Checked before the station creates its output file.
     if frames.is_none() && cfg.output.device.is_none() && !cfg.inputs_finite() {

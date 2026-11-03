@@ -390,6 +390,8 @@ pub struct Settings {
     pub flip: bool,
     /// Also accept spectrally inverted signals during acquisition.
     pub auto_flip: bool,
+    /// Receive DRM+ (robustness mode E, 192 kHz input) instead of DRM30.
+    pub drm_plus: bool,
     /// Pace recordings to real time (otherwise decode as fast as possible).
     pub realtime: bool,
     pub play_audio: bool,
@@ -446,6 +448,7 @@ impl Default for Settings {
             real_channel: ChannelChoice::Mix,
             flip: false,
             auto_flip: true,
+            drm_plus: false,
             realtime: true,
             play_audio: true,
             output_device: None,
@@ -524,6 +527,8 @@ impl Settings {
                 input: self.input_format(),
                 flip: self.flip,
                 auto_flip: self.auto_flip,
+                // DRM+ needs the wide input: not from a KiwiSDR (about 12 kHz).
+                drm_plus: self.drm_plus && self.source != SourceKind::Kiwi,
                 ..ReceiverConfig::default()
             },
             play_audio: self.play_audio,
@@ -716,6 +721,7 @@ mod tests {
             real_channel: ChannelChoice::Diff,
             flip: true,
             auto_flip: false,
+            drm_plus: true,
             realtime: false,
             play_audio: false,
             output_device: Some("Speakers".into()),

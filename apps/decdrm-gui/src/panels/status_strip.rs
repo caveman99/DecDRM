@@ -79,7 +79,10 @@ pub fn show(ui: &mut Ui, rx: &RxSession) {
         value(ui, "Mode", mode);
         let bw = r.occupancy.map_or_else(
             || "–".to_string(),
-            |o| format!("{} kHz (SO{})", o.bandwidth_khz(), o.value()),
+            |o| {
+                let m = r.mode.unwrap_or(decdrm_core::params::RobustnessMode::B);
+                format!("{} kHz (SO{})", o.bandwidth_khz_in(m), o.value())
+            },
         );
         value(ui, "BW", bw);
         if r.inverted {

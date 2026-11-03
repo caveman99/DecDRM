@@ -17,6 +17,7 @@ pub const EXAMPLE_JOURNALINE: &str =
     include_str!("../../../crates/decdrm-station/examples/journaline.toml");
 
 /// Frame duration, seconds.
+#[cfg(test)]
 const FRAME_SECONDS: f64 = 0.4;
 
 /// Directory for the untitled example's companion files and relative outputs:
@@ -139,8 +140,14 @@ pub fn line_start_char(text: &str, line: usize) -> usize {
 
 /// Frames for a duration limit (400 ms each, rounded up); `None` for a non-positive
 /// or non-finite duration.
+#[cfg(test)]
 pub fn frames_for(seconds: f64) -> Option<u64> {
-    (seconds.is_finite() && seconds > 0.0).then(|| (seconds / FRAME_SECONDS).ceil() as u64)
+    frames_of(seconds, FRAME_SECONDS)
+}
+
+/// [`frames_for`] with frames of `frame_s` seconds (DRM+: 0.1).
+pub fn frames_of(seconds: f64, frame_s: f64) -> Option<u64> {
+    (seconds.is_finite() && seconds > 0.0).then(|| (seconds / frame_s).ceil() as u64)
 }
 
 /// `true` if the programme ends by itself: there is audio and every audio input is a
@@ -363,6 +370,7 @@ mod tests {
     fn durations_become_frames() {
         assert_eq!(frames_for(0.4), Some(1));
         assert_eq!(frames_for(1.0), Some(3));
+        assert_eq!(frames_of(1.0, 0.1), Some(10));
         assert_eq!(frames_for(60.0), Some(150));
         assert_eq!(frames_for(0.0), None);
         assert_eq!(frames_for(f64::NAN), None);

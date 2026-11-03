@@ -10,7 +10,7 @@ pub mod track;
 use crate::cellmap::CellMap;
 use crate::dsp::{iir1, iir1_lambda, levinson, sinc};
 use crate::fec::qam::{EqCell, Mapping};
-use crate::params::{RobustnessMode, SAMPLE_RATE};
+use crate::params::RobustnessMode;
 use crate::tables::{DATA_CELL_POWER, QAM4, QAM16, QAM64_SM};
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
@@ -30,6 +30,7 @@ fn freq_wiener_len(mode: RobustnessMode) -> usize {
         RobustnessMode::A => 6,
         RobustnessMode::B | RobustnessMode::C => 11,
         RobustnessMode::D => 13,
+        RobustnessMode::E => 11,
     }
 }
 
@@ -135,9 +136,9 @@ impl ChannelEstimator {
         let track = PdsTracker::new(&map, num_pil, delay + 1);
         let fw_len = freq_wiener_len(map.mode());
         let ns = map.symbols_per_frame;
-        let sym_rate = Real::from(SAMPLE_RATE) / map.mode().symbol_len() as Real;
-        let sys_bw = n_car as Real / map.mode().fft_size() as Real * Real::from(SAMPLE_RATE);
-        let nom_bw = map.occupancy().bandwidth_khz() * 1000.0;
+        let sym_rate = Real::from(map.mode().sample_rate()) / map.mode().symbol_len() as Real;
+        let sys_bw = n_car as Real / map.mode().fft_size() as Real * Real::from(map.mode().sample_rate());
+        let nom_bw = map.layout.bandwidth_khz() * 1000.0;
         let mut est = Self {
             n_car,
             x,
@@ -406,9 +407,9 @@ impl ChannelEstimator {
             self.wmm_sig = 0.0;
         }
         self.stats.doppler_hz = 2.0 * self.tw.sigma();
-        let ir_sample_ms = map.mode().fft_size() as Real / (Real::from(SAMPLE_RATE) * (self.num_pil * self.x) as Real) * 1000.0;
+        let ir_sample_ms = map.mode().fft_size() as Real / (Real::from(map.mode().sample_rate()) * (self.num_pil * self.x) as Real) * 1000.0;
         let (gn, gd) = map.mode().guard_ratio();
-        let symbol_s = map.mode().fft_size() as Real * (1.0 + gn as Real / gd as Real) / Real::from(SAMPLE_RATE);
+        let symbol_s = map.mode().fft_size() as Real * (1.0 + gn as Real / gd as Real) / Real::from(map.mode().sample_rate());
         let keep = (1.0 / symbol_s).ceil() as usize;
         self.delay_hist.push_back((self.last_track.pds_len * ir_sample_ms).max(0.0));
         while self.delay_hist.len() > keep {

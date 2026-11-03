@@ -720,7 +720,7 @@ impl OpusEncoder {
         let enc = OpusDrmEncoder::new(OpusEncoderConfig::new(plan.input_channels, plan.opus_packet_bytes))?;
         Ok(Self {
             enc,
-            fmt: AacSuperFrameFormat::opus(stream),
+            fmt: AacSuperFrameFormat::opus_frames(plan.frames_per_super_frame, stream),
             granule: decdrm_codecs::OPUS_FRAME_LEN * plan.input_channels,
             encoder_errors: 0,
         })
@@ -923,6 +923,9 @@ pub(crate) struct AudioChain {
     title: Option<String>,
     stream_len: usize,
     pcm: Vec<f32>,
+    /// Mode E: the second half of the audio super frame whose first half went out with
+    /// the last logical frame.
+    second_half: Option<Vec<u8>>,
     pub counters: AudioCounters,
 }
 
@@ -963,6 +966,7 @@ impl AudioChain {
             title: None,
             stream_len: stream.total(),
             pcm: Vec::new(),
+            second_half: None,
             counters: AudioCounters::default(),
         })
     }
@@ -984,10 +988,15 @@ impl AudioChain {
         self.title = title;
     }
 
-    /// The stream bytes of the next multiplex frame.
+    /// The stream bytes of the next multiplex frame. In mode E an audio super frame
+    /// (200 ms) fills two logical frames: the first call encodes it and returns its first
+    /// half, the next call its second (each with its own text message piece).
     pub fn next_logical_frame(&mut self, service_name: &str) -> Result<Vec<u8>> {
-        // 400 ms at the encoder's input rate.
-        let frames = self.plan.input_rate as usize * 2 / 5;
+        if let Some(half) = self.second_half.take() {
+            return Ok(self.with_text(half));
+        }
+        // 400 ms (mode E: 200 ms) at the encoder's input rate.
+        let frames = self.plan.input_rate as usize * 2 / 5 / self.plan.logical_frames;
         self.pcm.clear();
         self.source
             .read(frames, &mut self.pcm)
@@ -1025,14 +1034,25 @@ impl AudioChain {
                 sf
             }
         };
+        self.counters.super_frames += 1;
+        if self.plan.logical_frames > 1 {
+            let second = lf.split_off(lf.len() / 2);
+            self.second_half = Some(second);
+        }
+        Ok(self.with_text(lf))
+    }
+
+    /// A logical frame from (part of) an audio super frame: with the next text message
+    /// piece in its last four bytes when text is sent.
+    fn with_text(&mut self, mut lf: Vec<u8>) -> Vec<u8> {
         if let Some(t) = self.text.as_mut() {
             lf.resize(self.stream_len, 0);
             insert_text_message(&mut lf, t.next_piece());
         }
         debug_assert_eq!(lf.len(), self.stream_len);
-        self.counters.super_frames += 1;
-        Ok(lf)
+        lf
     }
+
 
     /// Whether the input is a non-looping file that has ended.
     pub fn input_finished(&self) -> bool {

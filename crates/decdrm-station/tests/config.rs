@@ -43,6 +43,39 @@ fn has(problems: &[String], needle: &str) -> bool {
     problems.iter().any(|p| p.contains(needle))
 }
 
+/// The DRM+ example: mode E, 192 kHz I/Q output, its audio super frames over two
+/// logical frames; and the mode E checks.
+#[test]
+fn drm_plus_example_and_checks() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/drm_plus.toml");
+    let cfg = StationConfig::load(&path).unwrap();
+    let plan = cfg.validate().unwrap_or_else(|e| panic!("{e}"));
+    println!("{}", plan.describe(&cfg));
+    assert_eq!(plan.layout, decdrm_core::params::ChannelLayout::DRM_PLUS);
+    assert!((plan.frame_seconds() - 0.1).abs() < 1e-12);
+    let audio = plan.services[0].audio.as_ref().unwrap();
+    assert_eq!((audio.logical_frames, audio.frames_per_super_frame, audio.core_rate), (2, 5, 24_000));
+    // Two logical frames, each with its text bytes.
+    assert_eq!(audio.super_frame_len, 2 * (plan.streams[0].bytes() - 4));
+
+    let problems = |edit: &dyn Fn(&mut StationConfig)| -> Vec<String> {
+        let mut c = cfg.clone();
+        edit(&mut c);
+        match c.validate() {
+            Ok(_) => Vec::new(),
+            Err(decdrm_station::StationError::Config(p)) => p.0,
+            Err(e) => vec![e.to_string()],
+        }
+    };
+    assert!(has(&problems(&|c| c.channel.occupancy = 3), "only has occupancy 0"));
+    assert!(has(&problems(&|c| c.channel.msc_mode = "64-QAM".parse().unwrap()), "4-QAM or 16-QAM"));
+    assert!(has(&problems(&|c| c.channel.sdc_mode = "16-QAM".parse().unwrap()), "4-QAM-robust"));
+    assert!(has(&problems(&|c| c.channel.interleaving = "short".parse().unwrap()), "only long interleaving"));
+    let aac12 = |c: &mut StationConfig| c.services[0].audio.as_mut().unwrap().core_rate = Some(12_000);
+    assert!(has(&problems(&aac12), "not allowed in mode E"));
+    assert!(problems(&|c| c.channel.protection_b = 3).is_empty());
+}
+
 #[test]
 fn example_configuration_is_valid() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/station.toml");
@@ -265,7 +298,7 @@ fn audio_in_hierarchical_stream_or_part_a() {
     let mut lens: Vec<StreamLengths> = plan.streams.iter().map(|s| s.lengths).collect();
     lens[0].part_a += 1;
     let cells = decdrm_core::cellmap::CellMap::new(plan.tx.mode, plan.tx.occupancy).unwrap().msc_cells_per_frame;
-    let p = decdrm_core::fec::mlc::MlcParams::msc(plan.tx.msc_mode.mapping(), cells, plan.tx.protection, lens[0].part_a);
+    let p = decdrm_core::fec::mlc::MlcParams::msc(plan.tx.mode, plan.tx.msc_mode.mapping(), cells, plan.tx.protection, lens[0].part_a);
     assert!(8 * (total + 1) > p.bits_hpp + p.bits_lpp || p.n1 == 0);
 }
 
@@ -352,11 +385,11 @@ fn raw_applications_and_alternative_frequencies_are_checked() {
     }
     let p = problems(&(base() + "
     [simulate]
-    channel = 7
+    channel = 13
     snr_db = 100
     sample_rate_offset_ppm = 9000
 "));
-    for needle in ["channel 7 is not a DRM channel model", "snr_db 100", "sample_rate_offset_ppm 9000"] {
+    for needle in ["channel 13 is not a DRM channel model", "snr_db 100", "sample_rate_offset_ppm 9000"] {
         assert!(has(&p, needle), "{needle}: {p:#?}");
     }
     // Written back as TOML, the [afs] section survives; an empty one is left out.

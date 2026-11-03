@@ -1,0 +1,48 @@
+# DecDRM DRM+ (robustness mode E) station — run and receive with
+#
+#     decdrm tx crates/decdrm-station/examples/drm_plus.toml --duration 30
+#     decdrm rx drm_plus.wav --format iq --drm-plus
+#
+# DRM+ is the VHF flavour of DRM: a 100 kHz channel, 100 ms frames, 192 kHz output.
+# See station.toml for every setting; only what differs for mode E is explained here.
+
+[channel]
+mode = "E"                   # DRM+
+occupancy = 0                # the only one in mode E: 100 kHz
+msc_mode = "16-QAM"          # "4-QAM" (robust) or "16-QAM"
+sdc_mode = "4-QAM"           # "4-QAM" (code rate 0.5) or "4-QAM-robust" (0.25)
+interleaving = "long"        # mode E has only this one: 600 ms
+protection_b = 1             # 0-3: 4-QAM code rate 0.25, 0.33, 0.4, 0.5;
+                             # 16-QAM 0.33, 0.41, 0.5, 0.62
+
+[output]
+file = "drm_plus.wav"        # 192 kHz
+format = "iq"                # I/Q with the DRM+ signal centred at 0 Hz
+level_dbfs = -15
+
+# [simulate]                 # DRM+ channel models of annex B.2 (band II):
+# channel = 8                # 7 AWGN, 8 urban, 9 rural, 10 terrain obstructed,
+# snr_db = 15                # 11 hilly terrain, 12 SFN
+
+[time]
+enabled = true
+
+[[service]]
+label = "DecDRM Plus"
+id = 0xD0E001
+language = "English"
+programme_type = "Pop Music"
+
+[service.audio]
+codec = "he-aac"             # mode E: AAC at a 48 kHz core, or HE-AAC at a 24 kHz core
+stereo = true                # (5 or 10 frames per 200 ms audio super frame); "xhe-aac", "opus"
+text = ["DRM+ from DecDRM", "Robustness mode E, 100 kHz"]
+input = { tone_hz = 1000.0, level_dbfs = -12.0 }
+
+[[service]]
+label = "Plus Data"
+id = 0xD0E002
+[service.data]
+type = "journaline"
+path = "journaline.toml"
+bitrate = 8000

@@ -19,7 +19,6 @@
 use crate::cellmap::CellMap;
 use crate::dsp::fft::Fft;
 use crate::dsp::{hamming, iir1_lambda};
-use crate::params::SAMPLE_RATE;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 
@@ -118,6 +117,8 @@ pub struct PdsTracker {
     sym_len_ir: Real,
     /// Duration of one impulse-response sample, ms.
     ir_step_ms: Real,
+    /// Working sample rate, Hz (the unit of the SRO estimates).
+    fs: Real,
     guard_ms: Real,
     // Delay-spread estimate.
     pub pds_begin: Real,
@@ -136,7 +137,8 @@ impl PdsTracker {
         } else {
             (guard_ir + ((num_pil as Real - guard_ir) / 2.0).ceil() + 1.0) as usize
         };
-        let sym_rate = Real::from(SAMPLE_RATE) / mode.symbol_len() as Real;
+        let fs = Real::from(mode.sample_rate());
+        let sym_rate = fs / mode.symbol_len() as Real;
         let acq_cnt_max = (SAM_OFF_ACQ_LEN_S * sym_rate) as usize;
         let xc_period = ((SRO_STEP_S * sym_rate).round() as usize).max(1);
         Self {
@@ -170,8 +172,9 @@ impl PdsTracker {
             applied_hz: 0.0,
             frame_pos: 0.0,
             sym_len_ir: mode.symbol_len() as Real * ir_per_sample,
-            ir_step_ms: 1e3 / (ir_per_sample * Real::from(SAMPLE_RATE)),
-            guard_ms: mode.guard_len() as Real / Real::from(SAMPLE_RATE) * 1e3,
+            ir_step_ms: 1e3 / (ir_per_sample * fs),
+            fs,
+            guard_ms: mode.guard_len() as Real / fs * 1e3,
             pds_begin: 0.0,
             pds_end: guard_ir,
         }
@@ -390,7 +393,7 @@ impl PdsTracker {
     /// bins per symbol.
     fn sam_off_hz(&self, slope: Real) -> Real {
         let norm = slope / self.sym_len_ir;
-        Real::from(SAMPLE_RATE) * (1.0 - 1.0 / (1.0 + norm))
+        self.fs * (1.0 - 1.0 / (1.0 + norm))
     }
 }
 

@@ -41,6 +41,7 @@ fn main() {
     let fac = Fac {
         channel: ChannelParams {
             enhancement: false,
+            mode_e: false,
             frame_index: 0,
             afs_valid: false,
             occupancy: SpectrumOccupancy::SO_3,
@@ -53,6 +54,7 @@ fn main() {
             toggle: false,
         },
         service: ServiceParams { service_id: 1, short_id: 0, audio_ca: false, language: 0, is_data: false, descriptor: 0, data_ca: false },
+        service2: None,
     };
     let (mut samples_in, mut done_glitch) = (0usize, false);
     let mut last_fac_before = None;

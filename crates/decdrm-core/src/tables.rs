@@ -10,18 +10,49 @@ use crate::params::RobustnessMode;
 // Pilots and FAC positions (§8.4)
 // ---------------------------------------------------------------------------------
 
-/// Number of FAC cells per transmission frame (§8.4.5.1).
+/// Number of FAC cells per transmission frame in modes A–D (§8.5.2.1).
 pub const NUM_FAC_CELLS: usize = 65;
+/// Number of FAC cells per transmission frame in mode E (§8.5.2.1).
+pub const NUM_FAC_CELLS_E: usize = 244;
 
-/// FAC cell positions (symbol within frame, carrier index) (§8.4.5.1, tables 99–102).
-pub const fn fac_positions(mode: RobustnessMode) -> &'static [(u8, i16); NUM_FAC_CELLS] {
+/// Number of FAC cells per transmission frame (N_FAC, §7.2.1.2).
+pub const fn num_fac_cells(mode: RobustnessMode) -> usize {
+    if mode.is_drm_plus() { NUM_FAC_CELLS_E } else { NUM_FAC_CELLS }
+}
+
+/// FAC cell positions (symbol within frame, carrier index) (§8.5.2.1, tables 62–66),
+/// in mapping order.
+pub const fn fac_positions(mode: RobustnessMode) -> &'static [(u8, i16)] {
     match mode {
         RobustnessMode::A => &FAC_A,
         RobustnessMode::B => &FAC_B,
         RobustnessMode::C => &FAC_C,
         RobustnessMode::D => &FAC_D,
+        RobustnessMode::E => &FAC_E,
     }
 }
+
+/// Mode E (table 66): from symbol 5 on, the FAC carriers repeat every four symbols
+/// (16 carriers apart within a symbol), and the table stops after three cells of
+/// symbol 26.
+const FAC_E: [(u8, i16); NUM_FAC_CELLS_E] = {
+    // First carrier and number of cells for s mod 4 = 0, 1, 2, 3.
+    let rows: [(i16, usize); 4] = [(-82, 11), (-78, 11), (-90, 12), (-86, 12)];
+    let mut out = [(0u8, 0i16); NUM_FAC_CELLS_E];
+    let mut n = 0;
+    let mut s = 5;
+    while n < NUM_FAC_CELLS_E {
+        let (first, count) = rows[s % 4];
+        let mut i = 0;
+        while i < count && n < NUM_FAC_CELLS_E {
+            out[n] = (s as u8, first + 16 * i as i16);
+            n += 1;
+            i += 1;
+        }
+        s += 1;
+    }
+    out
+};
 
 const FAC_A: [(u8, i16); NUM_FAC_CELLS] = [
     (2, 26), (2, 46), (2, 66), (2, 86),
@@ -95,26 +126,28 @@ const FAC_D: [(u8, i16); NUM_FAC_CELLS] = [
     (22, 10), (22, 19), (22, 37),
 ];
 
-/// Frequency reference pilots: (carrier, phase₁₀₂₄) (§8.4.2, table 86). They are
+/// Frequency reference pilots: (carrier, phase₁₀₂₄) (§8.4.2, table 51). They are
 /// present in every symbol. In mode D the first two pilots are phase-inverted
-/// (+512) on odd symbols.
-pub const fn freq_pilots(mode: RobustnessMode) -> &'static [(i16, u16); 3] {
+/// (+512) on odd symbols. Mode E has none.
+pub const fn freq_pilots(mode: RobustnessMode) -> &'static [(i16, u16)] {
     match mode {
         RobustnessMode::A => &[(18, 205), (54, 836), (72, 215)],
         RobustnessMode::B => &[(16, 331), (48, 651), (64, 555)],
         RobustnessMode::C => &[(11, 214), (33, 392), (44, 242)],
         RobustnessMode::D => &[(7, 788), (21, 1014), (28, 332)],
+        RobustnessMode::E => &[],
     }
 }
 
 /// Time reference pilots in symbol 0 of each frame: (carrier, phase₁₀₂₄)
-/// (§8.4.3, table 87).
+/// (§8.4.3, tables 53–57).
 pub const fn time_pilots(mode: RobustnessMode) -> &'static [(i16, u16)] {
     match mode {
         RobustnessMode::A => &TIME_A,
         RobustnessMode::B => &TIME_B,
         RobustnessMode::C => &TIME_C,
         RobustnessMode::D => &TIME_D,
+        RobustnessMode::E => &TIME_E,
     }
 }
 
@@ -138,6 +171,33 @@ const TIME_D: [(i16, u16); 21] = [
     (14, 920), (15, 920), (17, 644), (18, 388), (20, 652), (21, 1014), (23, 176),
     (24, 176), (26, 752), (27, 496), (28, 332), (29, 432), (30, 964), (32, 452),
 ];
+const TIME_E: [(i16, u16); 21] = [
+    (-80, 219), (-79, 475), (-77, 987), (-53, 652), (-52, 652), (-51, 140), (-32, 819),
+    (-31, 819), (12, 907), (13, 907), (14, 651), (21, 903), (22, 391), (23, 903),
+    (40, 203), (41, 203), (42, 203), (67, 797), (68, 29), (79, 508), (80, 508),
+];
+
+/// AFS reference cells of mode E (§8.4.5, table 61): carriers k = −106 + 4i,
+/// i = 0..=53, in symbol 4 of the first and symbol 39 of the fourth frame of a super
+/// frame (super-frame symbols below), unboosted (power 1). Their phases for the two
+/// symbols, by carrier. Where a cell is also a gain reference the phases agree and the
+/// gain reference's amplitude counts.
+pub const AFS_E_SYMBOLS: [usize; 2] = [4, 3 * 40 + 39];
+pub const AFS_E_FIRST_CARRIER: i32 = -106;
+pub const AFS_E_SPACING: i32 = 4;
+pub const AFS_E_PHASES: [[u16; 54]; 2] = [
+    [
+        134, 866, 588, 325, 77, 868, 649, 445, 256, 82, 946, 801, 671, 556, 455, 369, 298, 242,
+        200, 173, 161, 164, 181, 213, 260, 322, 398, 489, 595, 716, 851, 1001, 142, 322, 516,
+        725, 949, 164, 417, 685, 968, 242, 554, 881, 199, 556, 927, 289, 690, 82, 512, 957,
+        393, 868,
+    ],
+    [
+        115, 135, 194, 293, 431, 608, 825, 57, 353, 688, 38, 452, 905, 373, 905, 452, 39, 689,
+        354, 59, 827, 610, 433, 295, 197, 138, 118, 138, 197, 295, 433, 610, 827, 59, 354, 689,
+        39, 452, 905, 373, 905, 452, 38, 688, 353, 57, 825, 608, 431, 293, 194, 135, 115, 134,
+    ],
+];
 
 /// Parameters of the gain reference (scattered) pilot grid (§8.4.4).
 #[derive(Debug, Clone, Copy)]
@@ -153,12 +213,40 @@ pub struct ScatteredPilotParams {
     pub k0: i32,
     /// Row size of the W and Z matrices.
     pub wz_cols: usize,
-    /// `W₁₀₂₄[n][m]`, row-major `y × wz_cols`.
+    /// `W₁₀₂₄[n][m]`, row-major `y × wz_cols` (mode E: `R₁₀₂₄`).
     pub w: &'static [i32],
-    /// `Z₂₅₆[n][m]`, row-major `y × wz_cols`.
+    /// `Z₂₅₆[n][m]`, row-major `y × wz_cols` (mode E: `Z₁₀₂₄`).
     pub z: &'static [i32],
-    /// Q₁₀₂₄.
+    /// Q₁₀₂₄ (modes A–D).
     pub q: i32,
+    /// Mode E: the matrix `Q₁₀₂₄[n][m]`, row-major `y × wz_cols`, which also selects the
+    /// mode E phase formula.
+    pub q_e: Option<&'static [i32]>,
+}
+
+impl ScatteredPilotParams {
+    /// Whether carrier `k` of frame symbol `s` is a gain reference position
+    /// (§8.4.4.1, table 58).
+    pub fn is_gain_ref(&self, s: usize, k: i32) -> bool {
+        (k - self.k0 - self.x * (s as i32 % self.y)).rem_euclid(self.x * self.y) == 0
+    }
+
+    /// Phase index ϑ₁₀₂₄[s, k] of the gain reference at frame symbol `s`, carrier `k`
+    /// (§8.4.4.3.1): (4·Z₂₅₆ + p·W₁₀₂₄ + p²·(1 + s)·Q₁₀₂₄) mod 1024 in modes A–D,
+    /// (p²·R₁₀₂₄ + p·Z₁₀₂₄ + Q₁₀₂₄) mod 1024 in mode E, with n = s mod y, m = ⌊s/y⌋,
+    /// p = (k − k₀ − n·x)/(x·y).
+    pub fn phase(&self, s: usize, k: i32) -> i32 {
+        let s = s as i32;
+        let n = s % self.y;
+        let m = s / self.y;
+        let p = (k - self.k0 - self.x * n) / (self.x * self.y);
+        let i = n as usize * self.wz_cols + m as usize;
+        let (w, z) = (self.w[i], self.z[i]);
+        match self.q_e {
+            Some(q) => (p * p * w + p * z + q[i]).rem_euclid(1024),
+            None => (4 * z + p * w + p * p * (1 + s) * self.q).rem_euclid(1024),
+        }
+    }
 }
 
 pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
@@ -173,6 +261,7 @@ pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
             w: &[228, 341, 455, 455, 569, 683, 683, 796, 910, 910, 0, 114, 114, 228, 341],
             z: &[0, 81, 248, 18, 106, 106, 122, 116, 31, 129, 129, 39, 33, 32, 111],
             q: 36,
+            q_e: None,
         },
         RobustnessMode::B => ScatteredPilotParams {
             freq_int: 2,
@@ -184,6 +273,7 @@ pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
             w: &[512, 0, 512, 0, 512, 0, 512, 0, 512, 0, 512, 0, 512, 0, 512],
             z: &[0, 57, 164, 64, 12, 168, 255, 161, 106, 118, 25, 232, 132, 233, 38],
             q: 12,
+            q_e: None,
         },
         RobustnessMode::C => ScatteredPilotParams {
             freq_int: 2,
@@ -201,6 +291,7 @@ pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
                 179, 178, 83, 253, 127, 105, 101, 198, 250, 145,
             ],
             q: 12,
+            q_e: None,
         },
         RobustnessMode::D => ScatteredPilotParams {
             freq_int: 1,
@@ -220,12 +311,42 @@ pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
                 165, 7, 252, 124, 253, 177, 197, 142,
             ],
             q: 14,
+            q_e: None,
+        },
+        // §8.4.4.3.6: R₁₀₂₄ (in `w`), Z₁₀₂₄ (in `z`) and Q₁₀₂₄, rows n = 0..=3,
+        // columns m = 0..=9.
+        RobustnessMode::E => ScatteredPilotParams {
+            freq_int: 4,
+            time_int: 4,
+            x: 4,
+            y: 4,
+            k0: 2,
+            wz_cols: 10,
+            w: &[
+                39, 118, 197, 276, 354, 433, 39, 118, 197, 276, //
+                37, 183, 402, 37, 183, 402, 37, 183, 402, 37, //
+                110, 329, 475, 110, 329, 475, 110, 329, 475, 110, //
+                79, 158, 236, 315, 394, 473, 79, 158, 236, 315,
+            ],
+            z: &[
+                473, 394, 315, 236, 158, 79, 0, 0, 0, 0, //
+                183, 914, 402, 37, 475, 841, 768, 768, 987, 183, //
+                549, 622, 475, 110, 37, 622, 256, 768, 329, 549, //
+                79, 158, 236, 315, 394, 473, 158, 315, 473, 630,
+            ],
+            q: 0,
+            q_e: Some(&[
+                329, 489, 894, 419, 607, 519, 1020, 942, 817, 939, //
+                824, 1023, 74, 319, 225, 207, 348, 422, 395, 92, //
+                959, 379, 7, 738, 500, 920, 440, 727, 263, 733, //
+                907, 946, 924, 91, 189, 133, 910, 804, 1022, 433,
+            ]),
         },
     }
 }
 
 /// Carrier indices of the boosted (power 4) gain references at the band edges,
-/// indexed by spectrum occupancy (§8.4.4.3.2, table 92). Zero rows are undefined
+/// indexed by spectrum occupancy (§8.4.4.2, table 59). Zero rows are undefined
 /// combinations.
 pub const fn boosted_pilots(mode: RobustnessMode, so: usize) -> [i16; 4] {
     const A: [[i16; 4]; 6] = [
@@ -265,6 +386,8 @@ pub const fn boosted_pilots(mode: RobustnessMode, so: usize) -> [i16; 4] {
         RobustnessMode::B => B[so],
         RobustnessMode::C => C[so],
         RobustnessMode::D => D[so],
+        RobustnessMode::E if so == 0 => [-106, -102, 102, 106],
+        RobustnessMode::E => [0; 4],
     }
 }
 
@@ -277,24 +400,27 @@ pub const BOOSTED_PILOT_POWER: f64 = 4.0;
 // Channel coding (§7.3)
 // ---------------------------------------------------------------------------------
 
-/// Constraint length of the DRM convolutional mother code (rate 1/4).
+/// Constraint length of the DRM convolutional mother code (rate 1/6).
 pub const CONSTRAINT_LENGTH: usize = 7;
 
 /// Number of trellis states.
 pub const NUM_STATES: usize = 1 << (CONSTRAINT_LENGTH - 1);
 
-/// Generator polynomials of the mother code, as tap masks over the shift register
-/// where bit `i` holds the input bit delayed by `i` (bit 0 = current input).
-/// The standard gives them as octal 133, 171, 145, 133 with the current input as the
-/// most significant tap; these are the bit-reversed forms (Dream's `byGeneratorMatrix`).
-pub const GENERATORS: [u8; 4] = [0o155, 0o117, 0o123, 0o155];
+/// Generator polynomials of the mother code (§7.3.2), as tap masks over the shift
+/// register where bit `i` holds the input bit delayed by `i` (bit 0 = current input).
+/// The standard gives them as octal 133, 171, 145, 133, 171, 145 with the current input
+/// as the most significant tap; these are the bit-reversed forms (Dream's
+/// `byGeneratorMatrix`). Outputs b₃–b₅ repeat b₀–b₂: DRM30 uses b₀–b₃ only, mode E's
+/// rate 1/6 all six.
+pub const GENERATORS: [u8; 6] = [0o155, 0o117, 0o123, 0o155, 0o117, 0o123];
 
-/// Which of the four mother-code outputs b0..b3 are transmitted for one input bit.
+/// Which of the six mother-code outputs b0..b5 are transmitted for one input bit.
 /// Bit `i` of the mask set ⇒ output `b_i` is kept (Dream's `PP_TYPE_*`).
 pub type PunctureMask = u8;
 
-/// The 13 code rates used by DRM, index 0..=12 (§7.3.1, table 66):
-/// 1/4, 3/10, 1/3, 4/11, 1/2, 4/7, 3/5, 2/3, 8/11, 3/4, 4/5, 7/8, 8/9.
+/// The code rates used by DRM (§7.3.2, table 27), index 0..=14: the 13 of DRM30
+/// (1/4, 3/10, 1/3, 4/11, 1/2, 4/7, 3/5, 2/3, 8/11, 3/4, 4/5, 7/8, 8/9) and the two
+/// that only mode E uses (1/6, 2/5), appended so the DRM30 indices stay.
 #[derive(Debug, Clone, Copy)]
 pub struct CodeRate {
     /// Numerator RX (input bits per puncturing period).
@@ -311,13 +437,14 @@ impl CodeRate {
     }
 }
 
+const P111111: PunctureMask = 0b11_1111;
 const P1111: PunctureMask = 0b1111;
 const P0111: PunctureMask = 0b0111;
 const P0011: PunctureMask = 0b0011;
 const P0001: PunctureMask = 0b0001;
 const P0101: PunctureMask = 0b0101;
 
-pub const CODE_RATES: [CodeRate; 13] = [
+pub const CODE_RATES: [CodeRate; 15] = [
     CodeRate { rx: 1, ry: 4, pattern: &[P1111] },
     CodeRate { rx: 3, ry: 10, pattern: &[P1111, P0111, P0111] },
     CodeRate { rx: 1, ry: 3, pattern: &[P0111] },
@@ -339,7 +466,14 @@ pub const CODE_RATES: [CodeRate; 13] = [
         ry: 9,
         pattern: &[P0011, P0001, P0001, P0001, P0001, P0001, P0001, P0001],
     },
+    CodeRate { rx: 1, ry: 6, pattern: &[P111111] },
+    CodeRate { rx: 2, ry: 5, pattern: &[P0111, P0011] },
 ];
+
+/// Index of rate 1/6 (the mother code) in [`CODE_RATES`] (mode E only).
+pub const RATE_1_6: usize = 13;
+/// Index of rate 2/5 in [`CODE_RATES`] (mode E only).
+pub const RATE_2_5: usize = 14;
 
 /// Puncturing patterns for the six tail bits, selected by
 /// `r_p = (2·N₂ − 12) − RY·⌊(2·N₂ − 12)/RY⌋` (§7.3.1, table 68).
@@ -380,12 +514,24 @@ pub const MSC64_HMMIX: [([usize; 6], usize); 4] = [
     ([7, 7, 7, 10, 12, 12], 45),
 ];
 
+/// Mode E MSC 4-QAM code-rate index per protection level (§7.5.1, table 29):
+/// 1/4, 1/3, 2/5, 1/2.
+pub const MSC4_E: [usize; 4] = [0, 2, RATE_2_5, 4];
+
+/// Mode E MSC 16-QAM code-rate indices per protection level: [R0, R1] and RYlcm
+/// (§7.5.1, table 31): overall rates 0.33, 0.41, 0.5, 0.62.
+pub const MSC16_E: [([usize; 2], usize); 4] = [([RATE_1_6, 4], 6), ([0, 5], 28), ([2, 7], 3), ([4, 9], 4)];
+
 /// SDC 16-QAM code-rate indices [R0, R1] (overall rate 0.5).
 pub const SDC16_RATES: [usize; 2] = [2, 7];
 /// SDC 4-QAM code-rate index (rate 0.5).
 pub const SDC4_RATE: usize = 4;
+/// Mode E SDC 4-QAM code-rate index of SDC mode 1 (rate 0.25, table 38).
+pub const SDC4_RATE_ROBUST: usize = 0;
 /// FAC 4-QAM code-rate index (rate 0.6).
 pub const FAC_RATE: usize = 6;
+/// Mode E FAC 4-QAM code-rate index (rate 0.25, table 40).
+pub const FAC_RATE_E: usize = 0;
 
 /// Bit-interleaver constants t₀ for the two interleaver types (§7.3.3).
 pub const BIT_INTERLEAVER_T0: [usize; 2] = [13, 21];
@@ -445,7 +591,55 @@ pub const QAM64_HMMIX_IM: [f64; 8] = [
 ];
 
 /// MSC dummy cells appended at the end of a super frame when the number of MSC cells
-/// is not a multiple of three (§7.7): alternating (1+j) and (1−j) scaled to the
-/// innermost constellation point.
+/// is not a multiple of the frames per super frame (§7.7, table 46): (1+j) and (1−j)
+/// scaled to the innermost constellation point.
 pub const DUMMY_CELL_64QAM: f64 = 0.154_303_349_9;
 pub const DUMMY_CELL_16QAM: f64 = 0.316_227_766_0;
+pub const DUMMY_CELL_4QAM: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Table 66 spot checks and the cell count.
+    #[test]
+    fn mode_e_fac_positions() {
+        let fac = fac_positions(RobustnessMode::E);
+        assert_eq!(fac.len(), num_fac_cells(RobustnessMode::E));
+        assert_eq!(fac[0], (5, -78));
+        assert_eq!(fac[10], (5, 82));
+        assert_eq!(fac[11], (6, -90));
+        assert_eq!(fac[46], (9, -78));
+        assert_eq!(&fac[241..], &[(26, -90), (26, -74), (26, -58)]);
+    }
+
+    /// The AFS reference phases of table 61 that the table marks as gain references
+    /// agree with the gain reference phase formula of mode E (which checks the
+    /// transcription of both).
+    #[test]
+    fn mode_e_afs_cells_agree_with_gain_reference_phases() {
+        let sp = scattered_pilots(RobustnessMode::E);
+        let mut shared = 0;
+        for (row, &sym) in AFS_E_SYMBOLS.iter().enumerate() {
+            let s = sym % 40;
+            for (i, &ph) in AFS_E_PHASES[row].iter().enumerate() {
+                let k = AFS_E_FIRST_CARRIER + AFS_E_SPACING * i as i32;
+                if sp.is_gain_ref(s, k) {
+                    assert_eq!(sp.phase(s, k), i32::from(ph), "s {s} k {k}");
+                    shared += 1;
+                }
+            }
+        }
+        assert_eq!(shared, 26);
+    }
+
+    #[test]
+    fn code_rate_patterns_match_their_rates() {
+        assert_eq!((CODE_RATES[RATE_1_6].rx, CODE_RATES[RATE_1_6].ry), (1, 6));
+        assert_eq!((CODE_RATES[RATE_2_5].rx, CODE_RATES[RATE_2_5].ry), (2, 5));
+        for r in &CODE_RATES {
+            let bits: u32 = r.pattern.iter().map(|m| m.count_ones()).sum();
+            assert_eq!((r.pattern.len(), bits as usize), (r.rx, r.ry));
+        }
+    }
+}

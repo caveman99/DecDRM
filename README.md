@@ -1,8 +1,9 @@
 # DecDRM
 
-A Digital Radio Mondiale (DRM30) receiver **and transmitter** written in Rust.
+A Digital Radio Mondiale (DRM30 and DRM+) receiver **and transmitter** written in Rust.
 
-DecDRM decodes DRM robustness modes A–D in every channel bandwidth (4.5–20 kHz) from
+DecDRM decodes DRM robustness modes A–D in every channel bandwidth (4.5–20 kHz), and
+DRM+ (mode E, the 100 kHz VHF variant, from 192 kHz I/Q or IF), from
 recordings or a live sound card (for example a virtual audio cable fed by a web SDR such
 as a KiwiSDR), and generates DRM signals from a station description. The signal
 processing is a spec-first reimplementation of ETSI ES 201 980 that borrows proven
@@ -47,8 +48,13 @@ encoding) and libopus.
   from a file, a sound card, a test tone or an internet radio stream (Icecast/SHOUTCAST
   over HTTP/HTTPS, MP3/AAC/Ogg/FLAC, its titles as text messages), WAV/FLAC or
   sound-card output (clock-drift compensated with a sound-card or stream input), plus a channel
-  simulator (the DRM channel models 1–6, noise, frequency and clock offsets:
-  `[simulate]` or `decdrm tx … --channel-model 3 --snr 18`) for testing receivers.
+  simulator (the DRM channel models 1–6 and the DRM+ ones 7–12, noise, frequency and
+  clock offsets: `[simulate]` or `decdrm tx … --channel-model 3 --snr 18`) for testing
+  receivers.
+- DRM+ (robustness mode E, ES 201 980 V4): 100 kHz channels, 4-/16-QAM, both SDC
+  modes, the 600 ms interleaver, AAC/HE-AAC/xHE-AAC/Opus with 200 ms audio super frames,
+  text and data — transmitted and received at 192 kHz (`mode = "E"` in the station
+  file, `decdrm rx --drm-plus`, the GUI's *DRM+* switch).
 - Desktop GUI (egui): spectrum, waterfall, constellations, audio spectrum, channel,
   impulse response, SNR per carrier, reception history, and two displays Dream lacks: a
   fading map (channel gain per carrier over time) and a delay–Doppler map (each
@@ -138,6 +144,10 @@ decdrm schedule --update
 decdrm tx crates/decdrm-station/examples/station.toml --check     # show the multiplex
 decdrm tx crates/decdrm-station/examples/station.toml --duration 30 --output drm.wav
 
+# DRM+ (mode E, 100 kHz): transmit at 192 kHz I/Q and receive it
+decdrm tx crates/decdrm-station/examples/drm_plus.toml --duration 30 --output plus.wav
+decdrm rx plus.wav --format iq --drm-plus
+
 # desktop GUI
 cargo run --release -p decdrm-gui -- recording.flac
 ```
@@ -162,7 +172,7 @@ messages, data objects and log lines as events.
 
 | Crate | Purpose |
 |---|---|
-| `decdrm-core` | DRM30 physical layer, FEC, multiplex, receiver and transmitter chains, channel simulator (pure Rust) |
+| `decdrm-core` | DRM30 and DRM+ physical layer, FEC, multiplex, receiver and transmitter chains, channel simulator (pure Rust) |
 | `decdrm-codecs` | FDK-AAC / libopus wrappers for DRM audio framing |
 | `decdrm-data` | Packet mode, MOT slideshow/website/EPG, Journaline, TPEG capture |
 | `decdrm-io` | WAV/FLAC, resampling, sound-card input/output, drift-compensated playback |

@@ -74,6 +74,11 @@ struct RxArgs {
     /// Mirror the spectrum (e.g. lower-sideband reception).
     #[arg(long)]
     flip: bool,
+    /// Receive DRM+ (robustness mode E, 100 kHz wide, VHF) instead of DRM30. The input
+    /// is taken at 192 kHz: I/Q with the signal near 0 Hz (±44 kHz), or a real IF centred
+    /// at 48 kHz. (Not from a KiwiSDR: its about 12 kHz cannot hold the signal.)
+    #[arg(long, conflicts_with = "kiwi")]
+    drm_plus: bool,
     /// Do not try spectrally inverted signals automatically.
     #[arg(long)]
     no_auto_flip: bool,
@@ -213,7 +218,13 @@ fn rx(a: RxArgs) -> Result<()> {
         Format::Iq => InputFormat::Iq { swap: false },
         Format::IqSwapped => InputFormat::Iq { swap: true },
     };
-    let receiver = ReceiverConfig { input: format, flip: a.flip, auto_flip: !a.no_auto_flip, ..Default::default() };
+    let receiver = ReceiverConfig {
+        input: format,
+        flip: a.flip,
+        auto_flip: !a.no_auto_flip,
+        drm_plus: a.drm_plus,
+        ..Default::default()
+    };
     let engine = Engine::start(EngineConfig {
         input,
         receiver,
@@ -327,7 +338,12 @@ fn print_status(s: &decdrm_engine::Snapshot) {
         s.input.position_s,
         r.state,
         r.mode.map(|m| m.to_string()).unwrap_or_else(|| "-".into()),
-        r.occupancy.map(|o| o.to_string()).unwrap_or_default(),
+        r.occupancy
+            .map(|o| {
+                let m = r.mode.unwrap_or(decdrm_engine::decdrm_core::params::RobustnessMode::B);
+                format!("SO{} ({} kHz)", o.value(), o.bandwidth_khz_in(m))
+            })
+            .unwrap_or_default(),
         f1(r.dc_frequency_hz),
         f1(r.snr_db),
         f1(r.mer_db),

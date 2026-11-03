@@ -16,9 +16,10 @@ fn main() {
     let mut out = OutputStage::new(tx.layout(), OutputConfig::iq(0.0)).unwrap();
     let cap = tx.msc_capacity();
     let fac = Fac {
-        channel: ChannelParams { enhancement: false, frame_index: 0, afs_valid: false, occupancy: so, interleaving: txc.interleaving,
+        channel: ChannelParams { enhancement: false, mode_e: false, frame_index: 0, afs_valid: false, occupancy: so, interleaving: txc.interleaving,
             msc_mode: txc.msc_mode, sdc_mode: txc.sdc_mode, num_audio: 1, num_data: 0, reconfiguration_index: 0, toggle: false },
         service: ServiceParams { service_id: 0x123456, short_id: 0, audio_ca: false, language: 5, is_data: false, descriptor: 1, data_ca: false },
+        service2: None,
     };
     let sdc = vec![0u8; tx.sdc_capacity_bytes()];
     let mut rx = Receiver::new(ReceiverConfig { input: InputFormat::Iq { swap: false }, channels: 2, ..Default::default() });

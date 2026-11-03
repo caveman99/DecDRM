@@ -28,9 +28,11 @@ pub struct FormCtx<'a> {
 /// The multiplex as a bar: MSC capacity and the streams that fill it.
 #[derive(Debug, Clone, Default)]
 pub struct PlanBar {
-    /// MSC bytes per 400 ms frame.
+    /// MSC bytes per frame.
     pub capacity: usize,
     pub segments: Vec<Segment>,
+    /// Milliseconds per frame (400; DRM+ 100).
+    pub frame_ms: f64,
 }
 
 /// One stream of the bar.
@@ -50,6 +52,7 @@ impl PlanBar {
     pub fn of(cfg: &decdrm_station::StationConfig, plan: &decdrm_station::MultiplexPlan) -> Self {
         let c = &plan.capacity;
         let capacity = (c.vspp_bits + c.hpp_bits + c.lpp_bits) / 8;
+        let frame_ms = plan.frame_seconds() * 1000.0;
         let label_of = |service: usize| cfg.services.get(service).map_or_else(|| format!("service {service}"), |s| s.label.clone());
         let segments = plan
             .streams
@@ -72,13 +75,13 @@ impl PlanBar {
                 }
             })
             .collect();
-        Self { capacity, segments }
+        Self { capacity, segments, frame_ms }
     }
 
     /// Bit rate of the audio stream of service `service` (position), kbit/s.
     pub fn audio_kbps(&self, service: usize) -> Option<f64> {
-        // Bytes per 400 ms frame: × 8 bits / 400 ms.
-        self.segments.iter().find(|s| s.service == Some(service)).map(|s| s.bytes as f64 * 8.0 / 400.0)
+        // Bytes per frame: × 8 bits / frame duration in ms.
+        self.segments.iter().find(|s| s.service == Some(service)).map(|s| s.bytes as f64 * 8.0 / self.frame_ms)
     }
 }
 
@@ -243,6 +246,25 @@ const MODES: &[(&str, &str)] = &[
     ("B", "B — sky wave (the usual choice)"),
     ("C", "C — long distance, strong echoes"),
     ("D", "D — severe Doppler and delay"),
+    ("E", "E — DRM+ (VHF, 100 kHz)"),
+];
+/// Mode E's only bandwidth.
+const OCCUPANCIES_E: &[(&str, &str)] = &[("0", "100 kHz")];
+const MSC_MODES_E: &[(&str, &str)] = &[("4-QAM", "4-QAM — robust"), ("16-QAM", "16-QAM — more capacity")];
+const SDC_MODES_E: &[(&str, &str)] =
+    &[("4-QAM", "4-QAM, code rate 0.5"), ("4-QAM-robust", "4-QAM, code rate 0.25 — most robust")];
+const INTERLEAVING_E: &[(&str, &str)] = &[("long", "600 ms (mode E's only depth)")];
+const PROTECTION_4_E: &[(&str, &str)] = &[
+    ("0", "0 — code rate 0.25 (most robust)"),
+    ("1", "1 — code rate 0.33"),
+    ("2", "2 — code rate 0.4"),
+    ("3", "3 — code rate 0.5"),
+];
+const PROTECTION_16_E: &[(&str, &str)] = &[
+    ("0", "0 — code rate 0.33 (most robust)"),
+    ("1", "1 — code rate 0.41"),
+    ("2", "2 — code rate 0.5"),
+    ("3", "3 — code rate 0.62"),
 ];
 const OCCUPANCIES: &[(&str, &str)] =
     &[("0", "4.5 kHz"), ("1", "5 kHz"), ("2", "9 kHz"), ("3", "10 kHz"), ("4", "18 kHz"), ("5", "20 kHz")];
@@ -263,6 +285,7 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
     let uep = uses_part_a(doc);
     let ch = section(doc, "channel");
     let mode = get_str(ch, "mode").unwrap_or_else(|| "B".into());
+    let plus = canon(&mode) == "e";
     let msc = get_str(ch, "msc_mode").unwrap_or_else(|| "64-QAM".into());
     let sixteen = canon(&msc) == "16qam";
     let hierarchical = canon(&msc).starts_with("hm");
@@ -274,23 +297,46 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
             if matches!(v, "C" | "D") && !matches!(get_int(ch, "occupancy"), Some(3 | 5)) {
                 set(ch, "occupancy", 3i64);
             }
+            // DRM+ and DRM30 share 16-QAM and 4-QAM SDC only, and mode E has one
+            // bandwidth and one interleaver.
+            let to_plus = v == "E";
+            if to_plus != plus {
+                set(ch, "occupancy", if to_plus { 0i64 } else { 3 });
+                set(ch, "interleaving", "long");
+                if !(to_plus || canon(&msc) == "16qam") || (to_plus && canon(&msc) != "16qam") {
+                    set(ch, "msc_mode", if to_plus { "4-QAM" } else { "64-QAM" });
+                }
+                let sdc = get_str(ch, "sdc_mode").map(|s| canon(&s)).unwrap_or_default();
+                if sdc != "4qam" {
+                    set(ch, "sdc_mode", "4-QAM");
+                }
+                if !to_plus {
+                    for key in ["protection_b", "protection_a"] {
+                        let level = get_int(ch, key).unwrap_or(1).min(1);
+                        set(ch, key, level);
+                    }
+                }
+            }
             changed = true;
         }
         ui.end_row();
         row_label(ui, "Bandwidth");
         let occ = get_int(ch, "occupancy").unwrap_or(3).to_string();
-        let allowed: Vec<(&str, &str)> =
-            OCCUPANCIES.iter().copied().filter(|(v, _)| !matches!(mode.as_str(), "C" | "D") || matches!(*v, "3" | "5")).collect();
+        let allowed: Vec<(&str, &str)> = if plus {
+            OCCUPANCIES_E.to_vec()
+        } else {
+            OCCUPANCIES.iter().copied().filter(|(v, _)| !matches!(mode.as_str(), "C" | "D") || matches!(*v, "3" | "5")).collect()
+        };
         if let Some(v) = combo(ui, "tx_occupancy", &occ, &allowed, 280.0) {
             set(ch, "occupancy", v.parse::<i64>().unwrap_or(3));
             changed = true;
         }
         ui.end_row();
         row_label(ui, "MSC modulation");
-        if let Some(v) = combo(ui, "tx_msc", &msc, MSC_MODES, 280.0) {
+        if let Some(v) = combo(ui, "tx_msc", &msc, if plus { MSC_MODES_E } else { MSC_MODES }, 280.0) {
             set(ch, "msc_mode", v);
-            // 16-QAM has protection levels 0-1 only.
-            if canon(v) == "16qam" {
+            // 16-QAM has protection levels 0-1 only (in mode E 0-3).
+            if canon(v) == "16qam" && !plus {
                 for key in ["protection_b", "protection_a"] {
                     if get_int(ch, key).unwrap_or(0) > 1 {
                         set(ch, key, 1i64);
@@ -305,19 +351,24 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
         ui.end_row();
         row_label(ui, "SDC modulation");
         let sdc = get_str(ch, "sdc_mode").unwrap_or_else(|| "16-QAM".into());
-        if let Some(v) = combo(ui, "tx_sdc", &sdc, SDC_MODES, 280.0) {
+        if let Some(v) = combo(ui, "tx_sdc", &sdc, if plus { SDC_MODES_E } else { SDC_MODES }, 280.0) {
             set(ch, "sdc_mode", v);
             changed = true;
         }
         ui.end_row();
         row_label(ui, "Interleaving");
         let il = get_str(ch, "interleaving").unwrap_or_else(|| "long".into());
-        if let Some(v) = combo(ui, "tx_interleaving", &il, INTERLEAVING, 280.0) {
+        if let Some(v) = combo(ui, "tx_interleaving", &il, if plus { INTERLEAVING_E } else { INTERLEAVING }, 280.0) {
             set(ch, "interleaving", v);
             changed = true;
         }
         ui.end_row();
-        let levels = if sixteen { PROTECTION_16 } else { PROTECTION_64 };
+        let levels = match (plus, sixteen) {
+            (true, true) => PROTECTION_16_E,
+            (true, false) => PROTECTION_4_E,
+            (false, true) => PROTECTION_16,
+            (false, false) => PROTECTION_64,
+        };
         row_label(ui, "Protection").on_hover_text("Error protection of the multiplex: a lower code rate survives a weaker signal, a higher one carries more");
         let pb = get_int(ch, "protection_b").unwrap_or(1).to_string();
         if let Some(v) = combo(ui, "tx_prot_b", &pb, levels, 280.0) {
@@ -1308,6 +1359,7 @@ fn channel_layout(doc: &DocumentMut) -> Option<ChannelLayout> {
         "b" => RobustnessMode::B,
         "c" => RobustnessMode::C,
         "d" => RobustnessMode::D,
+        "e" => RobustnessMode::E,
         _ => return None,
     };
     let occupancy = u8::try_from(ch.and_then(|ch| get_int(ch, "occupancy")).unwrap_or(3)).ok()?;
@@ -1618,7 +1670,8 @@ fn clock(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
 /// The multiplex as a bar: one segment per stream, sized by its bytes.
 pub fn capacity_bar(ui: &mut Ui, bar: &PlanBar) {
     let used: usize = bar.segments.iter().map(|s| s.bytes).sum();
-    let kbps = |bytes: usize| bytes as f64 * 8.0 / 400.0;
+    let kbps = |bytes: usize| bytes as f64 * 8.0 / bar.frame_ms;
+
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Multiplex").strong());
         ui.label(RichText::new(format!("{:.2} kbit/s MSC capacity, {:.0} % used", kbps(bar.capacity), 100.0 * used as f64 / bar.capacity.max(1) as f64)).weak());

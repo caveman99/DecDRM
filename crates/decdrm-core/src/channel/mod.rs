@@ -4,7 +4,8 @@
 //! sample-rate offset and additive white Gaussian noise (AWGN).
 //!
 //! The simulator works on the complex baseband signal produced by
-//! [`crate::tx::Transmitter`] (48 kHz, DC carrier at 0 Hz, unit-power data cells).
+//! [`crate::tx::Transmitter`] (48 kHz, DRM+ 192 kHz; DC carrier at 0 Hz, unit-power
+//! data cells). Models 7–12 are the DRM+ channels of table B.2.
 //! Convert its output with [`crate::tx::output::OutputStage`] to real IF or I/Q
 //! samples for the receiver. Processing order: multipath/fading → frequency offset →
 //! sample-rate offset → AWGN.
@@ -38,7 +39,7 @@ pub mod rng;
 pub use rng::Rng;
 
 use crate::cellmap::CellMap;
-use crate::params::{ChannelLayout, SAMPLE_RATE};
+use crate::params::ChannelLayout;
 use crate::{Cplx, Real};
 use fading::GaussianFading;
 use resample::Resampler;
@@ -103,7 +104,56 @@ impl ChannelModel {
         Some(Self { paths })
     }
 
-    /// Short name of DRM channel model `number` (for reports).
+    /// DRM+ channel model `number` (7..=12) of ES 201 980 annex B, table B.2 (mode E),
+    /// in band II (`carrier_mhz` 100) or III (200): the receiver velocities of the
+    /// table give the maximum Doppler frequency f_D. The table's classical (Jakes)
+    /// Doppler spectra are simulated as Gaussian ones of the same RMS spread (f_D/√2, a
+    /// spread 2σ of √2·f_D), its Gauss1/Gauss2 spectra as their main lobe only (centred
+    /// at −0.8·f_D with σ = 0.05·f_D, and at +0.7·f_D with σ = 0.1·f_D).
+    pub fn drm_plus(number: u8, carrier_mhz: Real) -> Option<Self> {
+        // (delay µs, power dB, Doppler type: 0 classical, 1 Gauss1, 2 Gauss2)
+        let (kmh, taps): (Real, &[(Real, Real, u8)]) = match number {
+            7 => (0.0, &[(0.0, 0.0, 0)]),
+            8 => (60.0, &[
+                (0.0, -2.0, 0), (0.2, 0.0, 0), (0.5, -3.0, 0), (0.9, -4.0, 0), (1.2, -2.0, 0),
+                (1.4, 0.0, 0), (2.0, -3.0, 0), (2.4, -5.0, 0), (3.0, -10.0, 0),
+            ]),
+            9 => (150.0, &[
+                (0.0, -4.0, 0), (0.3, -8.0, 0), (0.5, 0.0, 0), (0.9, -5.0, 0), (1.2, -16.0, 0),
+                (1.9, -18.0, 0), (2.1, -14.0, 0), (2.5, -20.0, 0), (3.0, -25.0, 0),
+            ]),
+            10 => (60.0, &[
+                (0.0, -8.0, 0), (1.0, -2.0, 0), (2.5, 0.0, 0), (3.5, -1.0, 0), (5.0, -2.0, 0),
+                (8.0, -3.0, 0), (12.0, 0.0, 0), (14.0, -6.0, 0), (16.0, -3.0, 0),
+            ]),
+            11 => (100.0, &[
+                (0.0, 0.0, 0), (0.5, -5.7, 0), (1.3, -12.7, 0), (1.9, -20.6, 0), (30.0, -3.1, 1),
+                (31.3, -5.4, 1), (34.9, -11.6, 1), (37.2, -15.9, 1), (39.1, -18.9, 1), (40.0, -25.7, 1),
+                (80.0, -4.5, 2), (82.7, -11.5, 2),
+            ]),
+            12 => (150.0, &[
+                (0.0, 0.0, 0), (100.0, -13.0, 1), (220.0, -18.0, 2), (290.0, -22.0, 1), (385.0, -26.0, 2),
+                (480.0, -31.0, 1), (600.0, -32.0, 2),
+            ]),
+            _ => return None,
+        };
+        let fd = kmh / 3.6 * carrier_mhz * 1e6 / 299_792_458.0;
+        let paths = taps
+            .iter()
+            .map(|&(us, db, ty)| {
+                let gain = 10f64.powf(db / 20.0);
+                let (shift, spread) = match ty {
+                    0 => (0.0, std::f64::consts::SQRT_2 * fd),
+                    1 => (-0.8 * fd, 0.1 * fd),
+                    _ => (0.7 * fd, 0.2 * fd),
+                };
+                Path::new(us / 1000.0, gain, shift, spread)
+            })
+            .collect();
+        Some(Self { paths })
+    }
+
+    /// Short name of DRM channel model `number` (for reports; 7–12 are DRM+ models).
     pub fn drm_name(number: u8) -> &'static str {
         match number {
             1 => "AWGN",
@@ -112,6 +162,12 @@ impl ChannelModel {
             4 => "CCIR Poor",
             5 => "Channel 5",
             6 => "Channel 6",
+            7 => "AWGN (DRM+)",
+            8 => "Urban",
+            9 => "Rural",
+            10 => "Terrain obstructed",
+            11 => "Hilly terrain",
+            12 => "SFN",
             _ => "unknown",
         }
     }
@@ -159,6 +215,11 @@ impl ChannelConfig {
     /// DRM channel model `number` (1..=6) at `snr_db`.
     pub fn drm(number: u8, snr_db: Real) -> Option<Self> {
         Some(Self { model: ChannelModel::drm(number)?, snr_db: Some(snr_db), ..Self::default() })
+    }
+
+    /// DRM+ channel model `number` (7..=12) in band II (100 MHz) at `snr_db`.
+    pub fn drm_plus(number: u8, snr_db: Real) -> Option<Self> {
+        Some(Self { model: ChannelModel::drm_plus(number, 100.0)?, snr_db: Some(snr_db), ..Self::default() })
     }
 }
 
@@ -227,16 +288,21 @@ impl ChannelSimulator {
     /// defines the reference signal power and the nominal bandwidth of the SNR).
     pub fn new(layout: ChannelLayout, cfg: ChannelConfig) -> Self {
         let map = CellMap::new(layout.mode, layout.occupancy).expect("a ChannelLayout is always valid");
-        let fs = Real::from(SAMPLE_RATE);
+        let fs = Real::from(layout.mode.sample_rate());
         let system_bw = map.num_carriers as Real * fs / layout.mode.fft_size() as Real;
-        Self::with_reference(map.avg_power_per_symbol, layout.occupancy.bandwidth_khz() * 1000.0, system_bw, cfg)
+        Self::with_reference(fs, map.avg_power_per_symbol, layout.bandwidth_khz() * 1000.0, system_bw, cfg)
     }
 
-    /// Simulator for an arbitrary complex signal of mean power `signal_power` whose
-    /// SNR is referred to `nominal_bw_hz` (and reported as "system" SNR relative to
-    /// `system_bw_hz`).
-    pub fn with_reference(signal_power: Real, nominal_bw_hz: Real, system_bw_hz: Real, cfg: ChannelConfig) -> Self {
-        let fs = Real::from(SAMPLE_RATE);
+    /// Simulator for an arbitrary complex signal at `fs` Hz of mean power
+    /// `signal_power` whose SNR is referred to `nominal_bw_hz` (and reported as "system"
+    /// SNR relative to `system_bw_hz`).
+    pub fn with_reference(
+        fs: Real,
+        signal_power: Real,
+        nominal_bw_hz: Real,
+        system_bw_hz: Real,
+        cfg: ChannelConfig,
+    ) -> Self {
         let mut master = Rng::new(cfg.seed);
         let total = cfg.model.power();
         let norm = if total > 0.0 { total.sqrt().recip() } else { 0.0 };
@@ -374,7 +440,7 @@ mod tests {
     }
 
     fn tone(f_hz: Real, n: usize) -> Vec<Cplx> {
-        let fs = Real::from(SAMPLE_RATE);
+        let fs = 48_000.0;
         (0..n).map(|i| Cplx::from_polar(1.0, 2.0 * PI * f_hz * i as Real / fs)).collect()
     }
 
@@ -383,6 +449,12 @@ mod tests {
         for n in 1..=6 {
             assert!(ChannelModel::drm(n).is_some(), "model {n}");
         }
+        for n in 7..=12 {
+            assert!(ChannelModel::drm_plus(n, 100.0).is_some(), "model {n}");
+        }
+        // Channel 12 (SFN) at 192 kHz: the 600 µs echo is 115 samples late.
+        let sim = ChannelSimulator::new(ChannelLayout::DRM_PLUS, ChannelConfig::drm_plus(12, 10.0).unwrap());
+        assert_eq!(sim.path_delays().last(), Some(&115));
         assert!(ChannelModel::drm(0).is_none() && ChannelModel::drm(7).is_none());
         let m = ChannelModel::drm(3).unwrap();
         assert_eq!(m.paths.len(), 4);

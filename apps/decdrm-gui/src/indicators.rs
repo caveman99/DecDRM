@@ -275,6 +275,7 @@ pub fn fmt_msc_mode(m: MscMode) -> &'static str {
         MscMode::Qam64HmSym => "64-QAM HMsym",
         MscMode::Qam64HmMix => "64-QAM HMmix",
         MscMode::Qam16Sm => "16-QAM",
+        MscMode::Qam4 => "4-QAM",
     }
 }
 
@@ -282,13 +283,14 @@ pub fn fmt_sdc_mode(m: SdcMode) -> &'static str {
     match m {
         SdcMode::Qam16 => "16-QAM",
         SdcMode::Qam4 => "4-QAM",
+        SdcMode::Qam4Robust => "4-QAM (R 0.25)",
     }
 }
 
 /// Interleaving depth as a word, and its duration for a tooltip.
 pub fn fmt_interleaving(i: Interleaving) -> (&'static str, &'static str) {
     match i {
-        Interleaving::Long => ("long", "long interleaving: 2 s (5 multiplex frames)"),
+        Interleaving::Long => ("long", "long interleaving: 2 s (5 multiplex frames; DRM+ 600 ms, 6 frames)"),
         Interleaving::Short => ("short", "short interleaving: 400 ms (1 multiplex frame)"),
     }
 }

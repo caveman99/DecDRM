@@ -179,6 +179,16 @@ impl Rx {
         }
     }
 
+    /// Working sample rate of the input, Hz (48 kHz, DRM+ 192 kHz; MDI: the frames
+    /// count as 19 200 samples at 48 kHz).
+    fn sample_rate(&self) -> f64 {
+        f64::from(match self {
+            Rx::Single(r) => r.config().sample_rate(),
+            Rx::Diversity(d) => d.branch(0).config().sample_rate(),
+            Rx::Mdi(_) => decdrm_core::params::SAMPLE_RATE,
+        })
+    }
+
     /// Input channels per sample frame (MDI: none).
     fn channels(&self, branch: usize) -> usize {
         match self {
@@ -454,12 +464,23 @@ impl Session {
         self.last_channel = None;
     }
 
-    /// Seconds of 48 kHz input processed.
-    pub fn time_s(&self) -> f64 {
-        self.samples_in as f64 / 48_000.0
+    /// Seconds per multiplex frame of the multiplex received: 0.4, DRM+ 0.1.
+    fn frame_seconds(&self) -> f64 {
+        if self.ens.channel().is_some_and(|c| c.mode_e) { 0.1 } else { 0.4 }
     }
 
-    /// Feed interleaved 48 kHz frames (diversity reception: of branch 0).
+    /// Seconds of input processed.
+    pub fn time_s(&self) -> f64 {
+        self.samples_in as f64 / self.rx.sample_rate()
+    }
+
+    /// Working sample rate the input is pushed at, Hz: 48 kHz, or 192 kHz for DRM+
+    /// ([`ReceiverConfig::drm_plus`]).
+    pub fn sample_rate(&self) -> u32 {
+        self.rx.sample_rate() as u32
+    }
+
+    /// Feed interleaved 48 kHz frames (DRM+: 192 kHz; diversity reception: of branch 0).
     pub fn push(&mut self, frames: &[f32]) -> Vec<SessionEvent> {
         self.push_branch(0, frames)
     }
@@ -556,7 +577,7 @@ impl Session {
                 *slot = Some(LogicalFrame { stream_id: p.stream_id, data: data.clone(), part_a_len: p.len_a / 8, hierarchical: p.hierarchical });
             }
         }
-        self.on_logical(&logical, true, &mut out);
+        self.on_logical(&logical, true, None, &mut out);
         out
     }
 
@@ -630,8 +651,15 @@ impl Session {
         });
         if changed {
             out.push(SessionEvent::Log(format!(
-                "{t:7.2}s {} · MSC {:?} · SDC {:?} · {:?} interleaving · {} audio / {} data services",
-                c.occupancy, c.msc_mode, c.sdc_mode, c.interleaving, c.num_audio, c.num_data
+                "{t:7.2}s {}SO{} ({} kHz) · MSC {:?} · SDC {:?} · {:?} interleaving · {} audio / {} data services",
+                if c.mode_e { "DRM+ " } else { "" },
+                c.occupancy.value(),
+                c.occupancy.bandwidth_khz_in(c.robustness_e().unwrap_or(RobustnessMode::B)),
+                c.msc_mode,
+                c.sdc_mode,
+                c.interleaving,
+                c.num_audio,
+                c.num_data
             )));
         }
         self.last_channel = Some(c);
@@ -691,7 +719,11 @@ impl Session {
                 if !same {
                     self.audio = None;
                     if let Some(stream) = stream {
-                        match build_audio(short_id, &params, stream) {
+                        let mode = match self.ens.channel() {
+                            Some(c) if c.mode_e => RobustnessMode::E,
+                            _ => RobustnessMode::B,
+                        };
+                        match build_audio(short_id, &params, stream, mode) {
                             Ok(p) => {
                                 self.audio_stats =
                                     AudioStats { codec: p.decoder.describe(), ..AudioStats::default() };
@@ -748,20 +780,27 @@ impl Session {
     fn on_msc(&mut self, frame: &MscFrame, out: &mut Vec<SessionEvent>) {
         let Some(mux) = self.ens.multiplex() else { return };
         let logical: Vec<Option<LogicalFrame>> = demultiplex(frame, mux);
-        self.on_logical(&logical, frame.complete, out);
+        self.on_logical(&logical, frame.complete, frame.position, out);
     }
 
     /// The streams of one multiplex frame (indexed by stream id) to the decoders.
     /// `complete`: false while the receiver's long interleaver still fills (the
-    /// content is unreliable then).
-    fn on_logical(&mut self, logical: &[Option<LogicalFrame>], complete: bool, out: &mut Vec<SessionEvent>) {
+    /// content is unreliable then); `position`: the frame of its super frame it went out
+    /// with, if known (mode E's audio super frames start at even ones).
+    fn on_logical(
+        &mut self,
+        logical: &[Option<LogicalFrame>],
+        complete: bool,
+        position: Option<usize>,
+        out: &mut Vec<SessionEvent>,
+    ) {
         // Content checks of this multiplex frame (passed, failed).
         let (mut good, mut bad) = (0u64, 0u64);
 
         if let Some(a) = self.audio.as_mut()
             && let Some(Some(lf)) = logical.get(a.stream_id as usize)
         {
-            let sf = a.deframer.push_frame(lf);
+            let sf = a.deframer.push_frame_at(lf, position);
             // Mute while the long interleaver is still filling: CRC-8 alone lets the
             // occasional garbage frame through.
             if complete {
@@ -860,15 +899,16 @@ impl Session {
     /// is described as that audio (not decodable).
     pub fn service_views(&self) -> Vec<crate::snapshot::ServiceView> {
         let lengths = self.ens.stream_lengths();
+        let frame_s = self.frame_seconds();
         self.ens
             .services()
             .map(|s| {
-                let mut v = service_view(s, &lengths);
+                let mut v = service_view(s, &lengths, frame_s);
                 if v.audio.is_none()
                     && let Some(c) = self.evs.iter().find(|c| c.short_id == s.short_id && c.locked())
                 {
                     v.audio = Some(evs_view(c));
-                    v.audio_bitrate = stream_bitrate(&lengths, c.app.stream_id);
+                    v.audio_bitrate = stream_bitrate(&lengths, c.app.stream_id, frame_s);
                     v.decodable = false;
                     v.warning = Some(EVS_WARNING.into());
                 }
@@ -923,12 +963,13 @@ fn evs_view(c: &EvsChannel) -> crate::snapshot::AudioCodingView {
     }
 }
 
-/// Bit rate of a stream of `lengths` (bytes per 400 ms multiplex frame), bit/s.
-fn stream_bitrate(lengths: &[StreamLengths], stream: u8) -> Option<f64> {
-    lengths.get(usize::from(stream)).map(|l| (l.part_a + l.part_b) as f64 * 8.0 / 0.4)
+/// Bit rate of a stream of `lengths` (bytes per multiplex frame of `frame_s` seconds),
+/// bit/s.
+fn stream_bitrate(lengths: &[StreamLengths], stream: u8, frame_s: f64) -> Option<f64> {
+    lengths.get(usize::from(stream)).map(|l| (l.part_a + l.part_b) as f64 * 8.0 / frame_s)
 }
 
-fn service_view(s: &ServiceInfo, lengths: &[StreamLengths]) -> crate::snapshot::ServiceView {
+fn service_view(s: &ServiceInfo, lengths: &[StreamLengths], frame_s: f64) -> crate::snapshot::ServiceView {
     let audio_stream = s.audio.as_ref().map(|a| a.stream_id);
     let audio_lengths = audio_stream.and_then(|id| lengths.get(usize::from(id)));
     let fac_language = s.fac.filter(|f| f.language != 0).and_then(|_| s.fac_language());
@@ -944,7 +985,7 @@ fn service_view(s: &ServiceInfo, lengths: &[StreamLengths]) -> crate::snapshot::
             .or_else(|| s.language_code.clone().filter(|c| !c.is_empty() && c != "---"))
             .unwrap_or_default(),
         audio: s.audio.as_ref().map(audio_view),
-        audio_bitrate: audio_stream.and_then(|id| stream_bitrate(lengths, id)),
+        audio_bitrate: audio_stream.and_then(|id| stream_bitrate(lengths, id, frame_s)),
         audio_part_a_percent: audio_lengths
             .filter(|l| l.part_a + l.part_b > 0)
             .map(|l| 100.0 * l.part_a as f64 / (l.part_a + l.part_b) as f64),
@@ -959,7 +1000,7 @@ fn service_view(s: &ServiceInfo, lengths: &[StreamLengths]) -> crate::snapshot::
                     stream_id: a.stream_id,
                     packet_mode: a.packet_mode,
                     packet_id: a.packet_id,
-                    stream_bitrate: stream_bitrate(lengths, a.stream_id),
+                    stream_bitrate: stream_bitrate(lengths, a.stream_id, frame_s),
                 }
             })
             .collect(),
@@ -1023,7 +1064,12 @@ fn app_name(app: UserApplication) -> String {
     }
 }
 
-fn build_audio(short_id: u8, params: &AudioParams, stream: StreamLengths) -> Result<AudioPipeline, String> {
+fn build_audio(
+    short_id: u8,
+    params: &AudioParams,
+    stream: StreamLengths,
+    mode: RobustnessMode,
+) -> Result<AudioPipeline, String> {
     let coding = match params.codec {
         AudioCodec::Aac => Some(DrmAudioCoding::Aac),
         AudioCodec::XheAac => Some(DrmAudioCoding::XheAac),
@@ -1032,7 +1078,8 @@ fn build_audio(short_id: u8, params: &AudioParams, stream: StreamLengths) -> Res
         AudioCodec::Encodec => return Err(decdrm_dac::ConfigError::Encodec.to_string()),
         AudioCodec::Reserved => return Err("reserved audio coding (CELP/HVXC are not supported)".into()),
     };
-    let deframer = AudioDeframer::new(params, stream).map_err(|e| e.to_string())?;
+    let deframer = AudioDeframer::for_mode(params, stream, mode).map_err(|e| e.to_string())?;
+
     let decoder = match coding {
         Some(coding) => open_decoder(coding, &params.type9_bytes).map_err(|e| e.to_string())?,
         None => open_dac(params)?,
@@ -1186,7 +1233,7 @@ mod tests {
                 type9_bytes: info.to_type9_bytes(),
             };
             let mut session = Session::new(ReceiverConfig::default());
-            session.audio = Some(build_audio(0, &params, StreamLengths { part_a: 0, part_b: len }).unwrap());
+            session.audio = Some(build_audio(0, &params, StreamLengths { part_a: 0, part_b: len }, RobustnessMode::B).unwrap());
             (session, Self { enc, framer: Default::default(), len, t: 0 })
         }
 
@@ -1227,7 +1274,7 @@ mod tests {
                 data[2 + border - 1] ^= 0x01;
                 damaged = true;
             }
-            session.on_logical(&logical(data), true, &mut events);
+            session.on_logical(&logical(data), true, None, &mut events);
         }
         assert!(damaged);
         let concealed = events.iter().filter(|e| matches!(e, SessionEvent::Audio(p) if p.concealed)).count();
@@ -1246,7 +1293,7 @@ mod tests {
             session.set_smooth_sbr(smooth);
             let mut events = Vec::new();
             for _ in 0..12 {
-                session.on_logical(&logical(stream.next_super_frame()), true, &mut events);
+                session.on_logical(&logical(stream.next_super_frame()), true, None, &mut events);
             }
             let pcm: Vec<PcmFrame> = events
                 .into_iter()
@@ -1297,7 +1344,7 @@ mod tests {
             applications: vec![app(1, 0, 0x002)],
             conditional_access: Vec::new(),
         };
-        let v = service_view(&audio, &lengths);
+        let v = service_view(&audio, &lengths, 0.4);
         let a = v.audio.as_ref().unwrap();
         assert_eq!((a.codec.as_str(), a.sbr, a.parametric_stereo, a.stereo), ("AAC", true, true, false));
         assert_eq!((a.sample_rate_hz, a.output_rate_hz, a.text), (24_000, 48_000, true));
@@ -1317,7 +1364,7 @@ mod tests {
             applications: vec![app(1, 1, 0x44A), app(1, 2, 0x123)],
             ..Default::default()
         };
-        let v = service_view(&data, &lengths);
+        let v = service_view(&data, &lengths, 0.4);
         assert!(v.audio.is_none() && v.audio_bitrate.is_none() && !v.decodable && v.ca);
         let names: Vec<&str> = v.apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Journaline", "application 0x123"]);

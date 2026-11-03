@@ -1,10 +1,11 @@
 //! The running station: produces the transmitter signal frame by frame and writes it
 //! to the configured sinks.
 //!
-//! Per 400 ms transmission frame ([`Station::transmit_frame`]):
+//! Per 400 ms transmission frame (mode E: 100 ms; [`Station::transmit_frame`]):
 //!
 //! 1. every audio service encodes 400 ms of input into an audio super frame of exactly
-//!    its stream length, with the next text message piece in the last four bytes;
+//!    its stream length, with the next text message piece in the last four bytes (mode
+//!    E: 200 ms into the stream lengths of two frames, sent half by half);
 //! 2. every data stream produces its packets ([`decdrm_data::DataEncoder`]);
 //! 3. [`multiplex`] assembles the MSC multiplex frame;
 //! 4. at the start of each super frame the SDC scheduler builds the SDC data field;
@@ -22,6 +23,7 @@ use crate::error::{Result, StationError};
 use crate::fac::FacScheduler;
 use crate::output::DeviceSink;
 use crate::plan::{FRAME_SECONDS, MultiplexPlan, StreamContent};
+use decdrm_core::params::RobustnessMode;
 use crate::sdc::{SdcScheduler, entities};
 use crate::webstream::WebStreamStatus;
 use decdrm_core::Cplx;
@@ -316,6 +318,7 @@ impl Station {
                     data_ca: false,
                 })
                 .collect(),
+            plan.layout.mode == RobustnessMode::E,
         );
         let start_unix = cfg
             .time
@@ -332,8 +335,9 @@ impl Station {
 
         // The outputs last, so that a configuration error leaves no empty file behind.
         let channels = output.channels();
-        let file = crate::output::open_file(&cfg, channels)?;
-        let device = DeviceSink::open(&cfg.output, channels)?;
+        let rate = plan.layout.mode.sample_rate();
+        let file = crate::output::open_file(&cfg, channels, rate)?;
+        let device = DeviceSink::open(&cfg.output, channels, rate)?;
 
         let output_file = cfg.output.file.as_ref().map(|f| cfg.resolve(f));
         let simulator = cfg.simulate.as_ref().and_then(|s| s.channel_config()).map(|c| {
@@ -496,7 +500,7 @@ impl Station {
         let msc = multiplex(&refs, &self.plan.multiplex, self.plan.geometry())?;
 
         let sdc = if self.tx.frame_index() == 0 {
-            let now = self.start_unix + self.status.frames as f64 * FRAME_SECONDS;
+            let now = self.start_unix + self.status.frames as f64 * self.plan.frame_seconds();
             Some(self.sdc.next_block(now.floor() as i64)?)
         } else {
             None
@@ -651,7 +655,7 @@ impl Station {
 
     fn update_status(&mut self) {
         let st = &mut self.status;
-        st.seconds = st.frames as f64 * FRAME_SECONDS;
+        st.seconds = st.frames as f64 * self.plan.frame_seconds();
         st.clipped_samples = self.output.clipped_samples();
         st.device = self.device.as_ref().map(|d| d.name().to_string());
         st.device_underruns = self.device.as_ref().map_or(0, DeviceSink::underruns);

@@ -24,7 +24,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// Complete description of a DRM30 station: the channel (robustness mode, bandwidth,
+/// Complete description of a DRM30 or DRM+ station: the channel (robustness mode, bandwidth,
 /// modulation, protection), where the signal goes, the clock, and one to four services.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -142,21 +142,23 @@ pub(crate) fn line_column(text: &str, offset: usize) -> (usize, usize) {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ChannelSettings {
-    /// Robustness mode A–D (ES 201 980 §8.1).
+    /// Robustness mode A–D (DRM30, ES 201 980 §8.1), or E (DRM+: 100 kHz, 192 kHz
+    /// output).
     pub mode: Mode,
     /// Spectrum occupancy 0–5: 4.5, 5, 9, 10, 18 or 20 kHz. Modes C and D only exist
-    /// with 3 and 5.
+    /// with 3 and 5, mode E only with 0 (100 kHz).
     pub occupancy: u8,
     /// MSC constellation: 16-QAM, 64-QAM, or 64-QAM with hierarchical mapping (HMsym,
-    /// HMmix; then one stream must be marked `hierarchical`).
+    /// HMmix; then one stream must be marked `hierarchical`); mode E: 4-QAM or 16-QAM.
     pub msc_mode: MscModeSetting,
-    /// SDC constellation: 4-QAM (robust, about half the capacity) or 16-QAM.
+    /// SDC constellation: 4-QAM (robust, about half the capacity) or 16-QAM; mode E:
+    /// 4-QAM (code rate 0.5) or 4-QAM-robust (0.25).
     pub sdc_mode: SdcModeSetting,
-    /// MSC interleaving: long (2 s) or short (400 ms).
+    /// MSC interleaving: long (2 s; mode E 600 ms, its only depth) or short (400 ms).
     pub interleaving: InterleavingSetting,
     /// Protection level of part A, the higher protected part (only used when a stream
-    /// is placed in part A: unequal error protection). 0–1 for 16-QAM, 0–3 for 64-QAM;
-    /// 0 is the most robust.
+    /// is placed in part A: unequal error protection). 0–1 for 16-QAM, 0–3 for 64-QAM
+    /// and in mode E; 0 is the most robust.
     pub protection_a: u8,
     /// Protection level of part B (all streams with equal error protection).
     pub protection_b: u8,
@@ -195,7 +197,7 @@ impl ChannelSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct OutputSettings {
-    /// WAV or FLAC file (by extension), 48 kHz, one channel (real) or two (I/Q).
+    /// WAV or FLAC file (by extension), 48 kHz (mode E: 192 kHz), one channel (real) or two (I/Q).
     pub file: Option<PathBuf>,
     /// Sample format of the file: int16 (default), int24 or float32 (WAV only).
     pub sample_format: SampleFormat,
@@ -329,7 +331,9 @@ impl SimulateSettings {
     /// The simulator's settings; `None` for an invalid channel model number.
     pub fn channel_config(&self) -> Option<decdrm_core::channel::ChannelConfig> {
         Some(decdrm_core::channel::ChannelConfig {
-            model: decdrm_core::channel::ChannelModel::drm(self.channel)?,
+            // 1-6 the DRM30 models, 7-12 the DRM+ ones (band II).
+            model: decdrm_core::channel::ChannelModel::drm(self.channel)
+                .or_else(|| decdrm_core::channel::ChannelModel::drm_plus(self.channel, 100.0))?,
             snr_db: self.snr_db,
             freq_offset_hz: self.frequency_offset_hz,
             sample_rate_offset_ppm: self.sample_rate_offset_ppm,
@@ -831,7 +835,7 @@ macro_rules! string_setting {
     };
 }
 
-/// Robustness mode A–D.
+/// Robustness mode A–E.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Mode(pub RobustnessMode);
@@ -843,7 +847,8 @@ string_setting!(
         "b" => Ok(Mode(RobustnessMode::B)),
         "c" => Ok(Mode(RobustnessMode::C)),
         "d" => Ok(Mode(RobustnessMode::D)),
-        _ => Err(format!("unknown robustness mode \"{s}\" (use A, B, C or D)")),
+        "e" | "drm+" | "drmplus" => Ok(Mode(RobustnessMode::E)),
+        _ => Err(format!("unknown robustness mode \"{s}\" (use A, B, C, D or E)")),
     },
     |m: Mode| m.0.to_string()
 );
@@ -860,9 +865,11 @@ string_setting!(
         "64qam" | "qam64" | "64qamsm" | "64" | "sm" => Ok(MscModeSetting(MscMode::Qam64Sm)),
         "hmsym" | "64qamhmsym" | "qam64hmsym" => Ok(MscModeSetting(MscMode::Qam64HmSym)),
         "hmmix" | "64qamhmmix" | "qam64hmmix" => Ok(MscModeSetting(MscMode::Qam64HmMix)),
-        _ => Err(format!("unknown MSC mode \"{s}\" (use 16-QAM, 64-QAM, HMsym or HMmix)")),
+        "4qam" | "qam4" | "qpsk" | "4" => Ok(MscModeSetting(MscMode::Qam4)),
+        _ => Err(format!("unknown MSC mode \"{s}\" (use 4-QAM, 16-QAM, 64-QAM, HMsym or HMmix)")),
     },
     |m: MscModeSetting| match m.0 {
+        MscMode::Qam4 => "4-QAM",
         MscMode::Qam16Sm => "16-QAM",
         MscMode::Qam64Sm => "64-QAM",
         MscMode::Qam64HmSym => "HMsym",
@@ -881,10 +888,12 @@ string_setting!(
     |s: &str| match norm(s).as_str() {
         "4qam" | "qam4" | "qpsk" | "4" => Ok(SdcModeSetting(SdcMode::Qam4)),
         "16qam" | "qam16" | "16" => Ok(SdcModeSetting(SdcMode::Qam16)),
-        _ => Err(format!("unknown SDC mode \"{s}\" (use 4-QAM or 16-QAM)")),
+        "4qamrobust" | "qam4robust" | "4qamr025" | "4qam025" => Ok(SdcModeSetting(SdcMode::Qam4Robust)),
+        _ => Err(format!("unknown SDC mode \"{s}\" (use 4-QAM or 16-QAM; mode E: 4-QAM or 4-QAM-robust)")),
     },
     |m: SdcModeSetting| match m.0 {
         SdcMode::Qam4 => "4-QAM",
+        SdcMode::Qam4Robust => "4-QAM-robust",
         SdcMode::Qam16 => "16-QAM",
     }
     .to_string()

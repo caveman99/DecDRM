@@ -62,9 +62,10 @@ use crate::config::{AppKind, Codec, Part, SbrRatio, SignalFormat, StationConfig}
 use crate::error::{ConfigProblems, Result, StationError};
 use crate::sdc;
 use decdrm_core::cellmap::CellMap;
-use decdrm_core::fac::MscMode;
+use decdrm_core::fac::Interleaving;
 use decdrm_core::fec::mlc::{MlcParams, MscProtection};
-use decdrm_core::mux::audio::{AacSuperFrameFormat, OPUS_FRAMES_PER_SUPER_FRAME, TEXT_MESSAGE_BYTES};
+use decdrm_core::mux::audio::{AacSuperFrameFormat, TEXT_MESSAGE_BYTES, opus_frames_per_super_frame};
+use decdrm_core::params::RobustnessMode;
 use decdrm_core::mux::msc::MscGeometry;
 use decdrm_core::mux::sdc::{MultiplexDescription, StreamLengths};
 use decdrm_core::mux::service::{AudioCodec, AudioMode, AudioParams};
@@ -76,7 +77,8 @@ use decdrm_io::Container;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-/// Seconds per multiplex frame.
+/// Seconds per multiplex frame in modes A–D (mode E: 0.1, see
+/// [`MultiplexPlan::frame_seconds`]).
 pub const FRAME_SECONDS: f64 = 0.4;
 
 /// Highest fraction of the AAC payload the encoder's bit rate is set to (see the
@@ -125,6 +127,8 @@ pub struct StreamPlan {
     /// Carried in the very strongly protected part (HMsym/HMmix).
     pub hierarchical: bool,
     pub content: StreamContent,
+    /// Seconds per multiplex frame (0.4, mode E 0.1).
+    pub frame_s: f64,
 }
 
 impl StreamPlan {
@@ -135,7 +139,7 @@ impl StreamPlan {
 
     /// Gross bit rate of the stream, bit/s.
     pub fn bitrate(&self) -> f64 {
-        self.bytes() as f64 * 8.0 / FRAME_SECONDS
+        self.bytes() as f64 * 8.0 / self.frame_s
     }
 }
 
@@ -183,11 +187,13 @@ pub struct AudioPlan {
     pub input_channels: usize,
     /// Text messages in the last four bytes of the stream.
     pub text: bool,
-    /// Audio frames per 400 ms super frame (5, 10 or 20; xHE-AAC: the average rounded
-    /// up).
+    /// Audio frames per super frame (400 ms: 5, 10 or 20; mode E's 200 ms: 5 or 10;
+    /// xHE-AAC: the average rounded up).
     pub frames_per_super_frame: usize,
-    /// Audio super frame bytes (stream minus text bytes).
+    /// Audio super frame bytes (stream minus text bytes; mode E: of two logical frames).
     pub super_frame_len: usize,
+    /// Logical frames an audio super frame spans (1, mode E 2).
+    pub logical_frames: usize,
     /// Bytes available for the coded frames (super frame minus header and CRC bytes;
     /// xHE-AAC: also minus the directory, on average).
     pub payload_len: usize,
@@ -250,6 +256,11 @@ pub struct AppPlan {
 }
 
 impl MultiplexPlan {
+    /// Seconds per transmission (and multiplex) frame: 0.4, or 0.1 in mode E.
+    pub fn frame_seconds(&self) -> f64 {
+        self.layout.mode.frame_duration_s()
+    }
+
     /// The MSC geometry for [`decdrm_core::mux::msc::multiplex`].
     pub fn geometry(&self) -> MscGeometry {
         MscGeometry { vspp_bits: self.capacity.vspp_bits, hpp_bits: self.capacity.hpp_bits, lpp_bits: self.capacity.lpp_bits }
@@ -283,7 +294,7 @@ impl MultiplexPlan {
             s,
             "mode {} / {} kHz (SO {}), MSC {} {prot}{hier}, SDC {}, {} interleaving",
             t.mode,
-            t.occupancy.bandwidth_khz(),
+            self.layout.bandwidth_khz(),
             t.occupancy.value(),
             crate::config::MscModeSetting(t.msc_mode),
             crate::config::SdcModeSetting(t.sdc_mode),
@@ -294,7 +305,7 @@ impl MultiplexPlan {
             s,
             "MSC {} bytes per frame ({:.2} kbit/s), SDC {} bytes per super frame",
             total / 8,
-            total as f64 / FRAME_SECONDS / 1000.0,
+            total as f64 / self.frame_seconds() / 1000.0,
             self.sdc_capacity
         );
         for st in &self.streams {
@@ -362,14 +373,18 @@ impl MultiplexPlan {
 // Codec limits
 // ---------------------------------------------------------------------------------
 
-/// Default AAC core rate of a codec (xHE-AAC: see [`default_xhe_rate`]).
-fn default_core_rate(codec: Codec) -> u32 {
-    match codec {
-        Codec::Aac | Codec::Dac | Codec::XheAac => 24_000,
-        Codec::HeAac | Codec::HeAacV2 => 12_000,
-        Codec::Opus => 48_000,
+/// Default core rate of a codec with robustness mode `mode`: in mode E AAC runs at
+/// 48 kHz and HE-AAC at a 24 kHz core (§5.4.1).
+fn default_core_rate_in(codec: Codec, mode: RobustnessMode) -> u32 {
+    match (codec, mode.is_drm_plus()) {
+        (Codec::Aac, true) => 48_000,
+        (Codec::HeAac | Codec::HeAacV2, true) => 24_000,
+        (Codec::Aac | Codec::Dac | Codec::XheAac, _) => 24_000,
+        (Codec::HeAac | Codec::HeAacV2, _) => 12_000,
+        (Codec::Opus, _) => 48_000,
     }
 }
+
 
 /// The xHE-AAC sampling rate for audio super frames of `super_frame_len` bytes when
 /// `sample_rate` is not set (see the module docs): 24 kHz up to 24 kbit/s, 32 kHz up to
@@ -554,8 +569,11 @@ fn check_output(cfg: &StationConfig, p: &mut Problems) {
 /// Checks of `[simulate]`.
 fn check_simulate(cfg: &StationConfig, p: &mut Problems) {
     if let Some(sim) = &cfg.simulate {
-        if !(1..=6).contains(&sim.channel) {
-            p.push(format!("simulate: channel {} is not a DRM channel model (1-6)", sim.channel));
+        if !(1..=12).contains(&sim.channel) {
+            p.push(format!(
+                "simulate: channel {} is not a DRM channel model (1-6, DRM+: 7-12)",
+                sim.channel
+            ));
         }
         if let Some(snr) = sim.snr_db
             && !(-20.0..=80.0).contains(&snr)
@@ -615,21 +633,43 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
     let ch = &cfg.channel;
 
     // --- Channel.
+    let mode = ch.mode.0;
     let layout = match ch.spectrum_occupancy() {
         None => {
             p.push(format!("channel: occupancy {} is outside 0-5", ch.occupancy));
             None
         }
         Some(so) => {
-            let l = ChannelLayout::new(ch.mode.0, so);
+            let l = ChannelLayout::new(mode, so);
             if l.is_none() {
-                p.push(format!("channel: robustness mode {} is only defined with occupancy 3 or 5", ch.mode));
+                p.push(if mode.is_drm_plus() {
+                    format!("channel: robustness mode E (DRM+) only has occupancy 0 (100 kHz), not {}", ch.occupancy)
+                } else {
+                    format!("channel: robustness mode {} is only defined with occupancy 3 or 5", ch.mode)
+                });
             }
             l
         }
     };
     let msc_mode = ch.msc_mode.0;
-    let max_level = if msc_mode == MscMode::Qam16Sm { 1 } else { 3 };
+    if !msc_mode.allowed_in(mode) {
+        p.push(if mode.is_drm_plus() {
+            format!("channel: mode E has 4-QAM or 16-QAM in the MSC, not {}", ch.msc_mode)
+        } else {
+            format!("channel: 4-QAM in the MSC exists in mode E only (use 16-QAM or 64-QAM with mode {})", ch.mode)
+        });
+    }
+    if !ch.sdc_mode.0.allowed_in(mode) {
+        p.push(if mode.is_drm_plus() {
+            "channel: mode E's SDC is 4-QAM or 4-QAM-robust, not 16-QAM".to_string()
+        } else {
+            format!("channel: 4-QAM-robust exists in mode E only (use 4-QAM or 16-QAM with mode {})", ch.mode)
+        });
+    }
+    if mode.is_drm_plus() && ch.interleaving.0 == Interleaving::Short {
+        p.push("channel: mode E has only long interleaving (600 ms); remove interleaving = \"short\"");
+    }
+    let max_level = msc_mode.max_protection_level(mode) as u8;
     // Part A's level is only used (and checked) when a stream is in part A.
     let uep = uses_part_a(cfg);
     for (what, level, max, used) in [
@@ -769,7 +809,8 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
 
     // --- Streams.
     let mut p = Problems::default();
-    let requests = stream_requests(cfg, &mut p);
+    let frame_s = layout.mode.frame_duration_s();
+    let requests = stream_requests(cfg, frame_s, &mut p);
     if requests.len() > MAX_STREAMS {
         p.push(format!(
             "{} streams needed ({} audio, the rest data), DRM allows at most {MAX_STREAMS}; share data streams with `stream = \"name\"`",
@@ -800,7 +841,7 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
         hierarchical: usize::from(ch.protection_hierarchical),
     };
     let n_mux = map.msc_cells_per_frame;
-    let base = MlcParams::msc(mapping, n_mux, protection, 0);
+    let base = MlcParams::msc(layout.mode, mapping, n_mux, protection, 0);
     let vspp_bytes = base.bits_vspp / 8;
 
     // Order: the hierarchical stream first, then configuration order.
@@ -839,7 +880,7 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
             lens[first] += total - assigned;
         }
         let part_a: usize = regular.iter().filter(|&&i| requests[i].part == Part::A).map(|&i| lens[i]).sum();
-        let params = MlcParams::msc(mapping, n_mux, protection, part_a);
+        let params = MlcParams::msc(layout.mode, mapping, n_mux, protection, part_a);
         if part_a > 0 && params.n1 == 0 {
             return None;
         }
@@ -851,8 +892,8 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
     let Some(params) = try_total(0, &mut lens) else {
         p.push(format!(
             "the data applications need {data_bytes} bytes per frame ({:.1} kbit/s) but the MSC holds only {main_bytes} ({:.1} kbit/s){}",
-            data_bytes as f64 * 8.0 / FRAME_SECONDS / 1000.0,
-            main_bytes as f64 * 8.0 / FRAME_SECONDS / 1000.0,
+            data_bytes as f64 * 8.0 / frame_s / 1000.0,
+            main_bytes as f64 * 8.0 / frame_s / 1000.0,
             if requests.iter().any(|r| r.part == Part::A) { " with this part A length" } else { "" }
         ));
         return Err(StationError::Config(ConfigProblems(p.0)));
@@ -888,7 +929,7 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
         } else {
             StreamLengths { part_a: lens[i], part_b: 0 }
         };
-        streams.push(StreamPlan { id: id as u8, lengths, hierarchical: r.hierarchical, content: r.content.clone() });
+        streams.push(StreamPlan { id: id as u8, lengths, hierarchical: r.hierarchical, content: r.content.clone(), frame_s });
     }
 
     // --- Services: audio plans and applications.
@@ -901,7 +942,7 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
             StreamContent::Audio { service } => {
                 let s = &cfg.services[*service];
                 let a = s.audio.as_ref().expect("audio request");
-                match audio_plan(a, stream) {
+                match audio_plan(a, stream, layout.mode) {
                     Ok(plan) => services[*service].audio = Some(plan),
                     Err(e) => p.push(format!("{}: {e}", service_name(cfg, *service))),
                 }
@@ -973,8 +1014,24 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
 
 /// Checks of an audio service's settings (codec, rate, text, input).
 fn check_audio(cfg: &StationConfig, name: &str, a: &crate::config::AudioSettings, p: &mut Problems) {
-    let rate = a.core_rate.unwrap_or_else(|| default_core_rate(a.codec));
-    if a.codec.is_aac() && !matches!(rate, 12_000 | 24_000) {
+    let mode = cfg.channel.mode.0;
+    let rate = a.core_rate.unwrap_or_else(|| default_core_rate_in(a.codec, mode));
+    if mode.is_drm_plus() {
+        // §5.4.1: 24 kHz (5 frames per 200 ms) or 48 kHz (10 frames, without SBR).
+        match (a.codec, rate) {
+            (Codec::Aac, 24_000 | 48_000) | (Codec::HeAac | Codec::HeAacV2, 24_000) => {}
+            (Codec::HeAac | Codec::HeAacV2, 48_000) => {
+                p.push(format!("{name}: AAC with SBR needs core_rate 24000 in mode E (48 kHz is for AAC without SBR)"))
+            }
+            (c, r) if c.is_aac() => {
+                p.push(format!("{name}: AAC core_rate {r} Hz is not allowed in mode E (use 24000 or 48000)"))
+            }
+            _ => {}
+        }
+        if a.codec == Codec::Dac {
+            p.push(format!("{name}: DAC is not available in mode E (its framing is made for 400 ms super frames)"));
+        }
+    } else if a.codec.is_aac() && !matches!(rate, 12_000 | 24_000) {
         p.push(format!("{name}: AAC core_rate {rate} Hz is not allowed (use 12000 or 24000)"));
     }
     if a.codec == Codec::Opus && rate != 48_000 {
@@ -1074,7 +1131,7 @@ fn uses_part_a(cfg: &StationConfig) -> bool {
 
 /// Collect the streams in configuration order: per service its audio, then its
 /// applications (shared streams where their name first appears).
-fn stream_requests(cfg: &StationConfig, p: &mut Problems) -> Vec<Request> {
+fn stream_requests(cfg: &StationConfig, frame_s: f64, p: &mut Problems) -> Vec<Request> {
     let mut requests: Vec<Request> = Vec::new();
     let mut shared: BTreeMap<String, usize> = BTreeMap::new();
     for (si, s) in cfg.services.iter().enumerate() {
@@ -1162,7 +1219,7 @@ fn stream_requests(cfg: &StationConfig, p: &mut Problems) -> Vec<Request> {
             };
         }
         let bits: f64 = r.app_bitrates.iter().sum();
-        let bytes = bits * FRAME_SECONDS / 8.0;
+        let bytes = bits * frame_s / 8.0;
         let packets = (bytes / *packet_len as f64).ceil().max(apps.len() as f64) as usize;
         r.bytes = packets * *packet_len;
     }
@@ -1175,30 +1232,40 @@ fn has_text(a: &crate::config::AudioSettings) -> bool {
     a.text.iter().any(|t| !t.is_empty()) || a.input.sends_titles()
 }
 
-/// Codec parameters of an audio service carried in `stream`.
-fn audio_plan(a: &crate::config::AudioSettings, stream: &StreamPlan) -> std::result::Result<AudioPlan, String> {
+/// Codec parameters of an audio service carried in `stream`, robustness mode `mode`
+/// (in mode E an audio super frame spans two logical frames, §5.2).
+fn audio_plan(
+    a: &crate::config::AudioSettings,
+    stream: &StreamPlan,
+    mode: RobustnessMode,
+) -> std::result::Result<AudioPlan, String> {
     match a.codec {
         Codec::Dac => return dac_plan(a, stream),
-        Codec::XheAac => return xhe_plan(a, stream),
+        Codec::XheAac => return xhe_plan(a, stream, mode),
         _ => {}
     }
     let codec = a.codec;
-    let core_rate = a.core_rate.unwrap_or_else(|| default_core_rate(codec));
+    let core_rate = a.core_rate.unwrap_or_else(|| default_core_rate_in(codec, mode));
     let stereo = a.stereo || codec == Codec::HeAacV2;
     let text = has_text(a);
     let len = stream.bytes();
-    let super_frame_len = len.saturating_sub(if text { TEXT_MESSAGE_BYTES } else { 0 });
-    let kbit = |bytes: usize| bytes as f64 * 8.0 / FRAME_SECONDS / 1000.0;
+    let halves = mode.frames_per_audio_super_frame();
+    let super_frame_len = halves * len.saturating_sub(if text { TEXT_MESSAGE_BYTES } else { 0 });
+    // Bit rates over the audio super frame (400 ms, mode E 200 ms) of `halves` streams.
+    let sf_s = stream.frame_s * halves as f64;
+    let kbit = |bytes: usize| bytes as f64 * 8.0 / sf_s / 1000.0;
+    let opus_frames = opus_frames_per_super_frame(mode);
     let (frames, fmt) = match codec {
-        Codec::Opus => (OPUS_FRAMES_PER_SUPER_FRAME, AacSuperFrameFormat::opus(stream.lengths)),
+        Codec::Opus => (opus_frames, AacSuperFrameFormat::opus_frames(opus_frames, stream.lengths)),
         _ => {
-            let n = if core_rate == 12_000 { 5 } else { 10 };
+            // 5 or 10 frames of 960 samples per super frame (table 10).
+            let n = (f64::from(core_rate) * sf_s / 960.0).round() as usize;
             (n, AacSuperFrameFormat::aac(n, stream.lengths))
         }
     };
     let payload_len = fmt.payload_len(super_frame_len).unwrap_or(0);
     // Header, CRC and text bytes around the coded frames.
-    let overhead = fmt.header_bytes() + frames + (len - super_frame_len);
+    let overhead = fmt.header_bytes() + frames + (halves * len - super_frame_len);
     let remedy = if stream.hierarchical {
         "the hierarchical stream's length is fixed by the channel: use a higher protection_hierarchical, \
          HMsym instead of HMmix, or a wider channel"
@@ -1207,21 +1274,21 @@ fn audio_plan(a: &crate::config::AudioSettings, stream: &StreamPlan) -> std::res
     };
     let (encoder_bitrate, opus_packet_bytes) = match codec {
         Codec::Opus => {
-            let packet = (payload_len / OPUS_FRAMES_PER_SUPER_FRAME).min(OPUS_MAX_PACKET);
+            let packet = (payload_len / opus_frames).min(OPUS_MAX_PACKET);
             if packet < OPUS_MIN_PACKET {
                 return Err(format!(
                     "{:.1} kbit/s left for the audio stream; Opus needs at least {:.1} kbit/s ({remedy})",
-                    kbit(len),
-                    kbit(OPUS_MIN_PACKET * OPUS_FRAMES_PER_SUPER_FRAME + overhead)
+                    kbit(halves * len),
+                    kbit(OPUS_MIN_PACKET * opus_frames + overhead)
                 ));
             }
             ((packet * 8 * 50) as u32, packet)
         }
         _ => {
-            let payload_rate = payload_len as f64 * 8.0 / FRAME_SECONDS;
+            let payload_rate = payload_len as f64 * 8.0 / sf_s;
             let bitrate = aac_encoder_bitrate(codec, core_rate, stereo, payload_rate);
             if let Err(min_rate) = bitrate {
-                let min_payload_bytes = (min_rate * FRAME_SECONDS / 8.0).ceil() as usize;
+                let min_payload_bytes = (min_rate * sf_s / 8.0).ceil() as usize;
                 let alternative = match (codec, core_rate) {
                     (Codec::HeAac | Codec::HeAacV2, _) => "use AAC, or ",
                     (Codec::Aac, 24_000) => "use a 12 kHz core, or ",
@@ -1230,7 +1297,7 @@ fn audio_plan(a: &crate::config::AudioSettings, stream: &StreamPlan) -> std::res
                 return Err(format!(
                     "{:.1} kbit/s left for the audio stream; {} with a {} kHz core{} needs at least {:.1} kbit/s \
                      ({alternative}{remedy})",
-                    kbit(len),
+                    kbit(halves * len),
                     match codec {
                         Codec::Aac => "AAC",
                         Codec::HeAac => "HE-AAC",
@@ -1265,6 +1332,7 @@ fn audio_plan(a: &crate::config::AudioSettings, stream: &StreamPlan) -> std::res
         text,
         frames_per_super_frame: frames,
         super_frame_len,
+        logical_frames: halves,
         payload_len,
         encoder_bitrate,
         opus_packet_bytes,
@@ -1287,15 +1355,23 @@ fn stream_remedy(stream: &StreamPlan) -> &'static str {
 /// xHE-AAC parameters of an audio service carried in `stream` (see the module docs):
 /// the sampling rate, the encoder configuration — checked without, then with libxaac —
 /// and SDC type 9 with the encoder's Static Config.
-fn xhe_plan(a: &crate::config::AudioSettings, stream: &StreamPlan) -> std::result::Result<AudioPlan, String> {
+fn xhe_plan(
+    a: &crate::config::AudioSettings,
+    stream: &StreamPlan,
+    mode: RobustnessMode,
+) -> std::result::Result<AudioPlan, String> {
     let text = has_text(a);
-    let len = stream.bytes();
-    let text_bytes = if text { TEXT_MESSAGE_BYTES } else { 0 };
+    let halves = mode.frames_per_audio_super_frame();
+    let len = halves * stream.bytes();
+    let text_bytes = if text { halves * TEXT_MESSAGE_BYTES } else { 0 };
     let super_frame_len = len.saturating_sub(text_bytes);
+    let sf_s = stream.frame_s * halves as f64;
     let sbr = a.sbr_ratio.unwrap_or_default();
-    let rate = a.sample_rate.unwrap_or_else(|| default_xhe_rate(super_frame_len, sbr));
+    // The default rate follows the bit rate (the table is per 400 ms super frame).
+    let rate = a.sample_rate.unwrap_or_else(|| default_xhe_rate((super_frame_len as f64 * 0.4 / sf_s) as usize, sbr));
     let channels: u16 = if a.stereo { 2 } else { 1 };
-    let mut config = XheAacConfig::with_super_frame_bytes(rate, channels, super_frame_len);
+    let mut config = XheAacConfig::with_super_frame_bytes(rate, channels, super_frame_len)
+        .with_super_frame_ms((sf_s * 1000.0).round() as u32);
     config.sbr = sbr.mode();
     let what = format!(
         "xHE-AAC {} at {} kHz{}",
@@ -1303,7 +1379,7 @@ fn xhe_plan(a: &crate::config::AudioSettings, stream: &StreamPlan) -> std::resul
         khz(rate),
         if sbr == SbrRatio::Auto { String::new() } else { format!(" with SBR ratio {sbr}") }
     );
-    let kbit = |bytes: usize| bytes as f64 * 8.0 / FRAME_SECONDS / 1000.0;
+    let kbit = |bytes: usize| bytes as f64 * 8.0 / sf_s / 1000.0;
     let budget = config.budget().map_err(|e| match config.min_super_frame_bytes() {
         Some(min) if super_frame_len < min => format!(
             "{:.1} kbit/s left for the audio stream; {what} needs at least {:.1} kbit/s ({})",
@@ -1338,7 +1414,8 @@ fn xhe_plan(a: &crate::config::AudioSettings, stream: &StreamPlan) -> std::resul
         text,
         frames_per_super_frame: encoder.frames_per_super_frame().ceil() as usize,
         super_frame_len,
-        payload_len: (budget.net_bitrate * FRAME_SECONDS / 8.0) as usize,
+        logical_frames: halves,
+        payload_len: (budget.net_bitrate * sf_s / 8.0) as usize,
         encoder_bitrate: budget.net_bitrate as u32,
         opus_packet_bytes: 0,
         params,
@@ -1394,7 +1471,7 @@ fn dac_plan(a: &crate::config::AudioSettings, stream: &StreamPlan) -> std::resul
         decdrm_dac::choose_config(super_frame_len, requested)
     };
     let config = chosen.map_err(|e| {
-        let kbit = |bytes: usize| bytes as f64 * 8.0 / FRAME_SECONDS / 1000.0;
+        let kbit = |bytes: usize| bytes as f64 * 8.0 / stream.frame_s / 1000.0;
         let remedy = if stream.hierarchical {
             "the hierarchical stream's length is fixed by the channel: use a higher protection_hierarchical, \
              HMsym instead of HMmix, or a wider channel"
@@ -1427,6 +1504,7 @@ fn dac_plan(a: &crate::config::AudioSettings, stream: &StreamPlan) -> std::resul
         text,
         frames_per_super_frame: decdrm_dac::FRAMES_PER_SUPER_FRAME,
         super_frame_len,
+        logical_frames: 1,
         payload_len: config.min_bytes(),
         encoder_bitrate: config.bits_per_second(),
         opus_packet_bytes: 0,

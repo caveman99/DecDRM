@@ -53,6 +53,12 @@ decdrm-gui recording.flac                      # the same in the GUI (then press
 - **Speed:** a file is decoded as fast as possible (about 100× real time).
   `--realtime` paces it to real time, and `--play` plays the audio, which implies real
   time. The GUI's *Real time* box does the same.
+- **DRM+:** a DRM+ signal (robustness mode E, 100 kHz wide, on VHF) needs `--drm-plus`
+  (in the GUI the *DRM+* box next to the format). The input is then taken at 192 kHz
+  (other rates are resampled): I/Q with the signal within ±44 kHz of 0 Hz, which is
+  how SDR software records a station it is tuned to, or a real IF centred at 48 kHz.
+  There is no frequency search across the band as with DRM30; the receiver locks in
+  about half a second and decodes at about 6× real time.
 
 ### From a KiwiSDR, directly
 
@@ -516,6 +522,11 @@ multiplex: streams, bit rates, codec settings and what goes where.
   - `interleaving` (short/long) and the protection levels: `protection_b` for every
     stream, and `protection_a` for streams with `part = "A"` (unequal error
     protection; it must be more robust, i.e. lower, than `protection_b`).
+  - DRM+ is `mode = "E"` with `occupancy = 0` (100 kHz), `msc_mode` 4-QAM or 16-QAM,
+    `sdc_mode` 4-QAM or 4-QAM-robust, long interleaving (600 ms) and protection levels
+    0–3. The output then runs at 192 kHz; audio is AAC at 48 kHz, HE-AAC at a 24 kHz
+    core, xHE-AAC or Opus (not DAC). See
+    [`examples/drm_plus.toml`](../crates/decdrm-station/examples/drm_plus.toml).
 - **`[output]`:**
   - `file` (WAV/FLAC) and/or `device` (sound card);
   - `format`: `real` IF with the DC carrier at `if_hz`, or `iq`. By default a real
@@ -579,7 +590,9 @@ multiplex: streams, bit rates, codec settings and what goes where.
 ### Test signals: the channel simulator
 
 `[simulate]` passes the signal through a DRM channel model before the outputs:
-- channel models 1–6 of ES 201 980 annex B (multipath with Rayleigh fading);
+- channel models 1–6 of ES 201 980 annex B (multipath with Rayleigh fading), and for
+  DRM+ the models 7–12 of table B.2 (7 AWGN, 8 urban, 9 rural, 10 terrain obstructed,
+  11 hilly terrain, 12 SFN; their Doppler for band II, 100 MHz);
 - white noise at a given SNR;
 - a frequency offset;
 - a receiver clock error.

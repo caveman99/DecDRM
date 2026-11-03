@@ -60,12 +60,17 @@ impl ViterbiDecoder {
         let mut word_metric = [0.0f64; 16];
 
         for (step, &mask) in masks.iter().enumerate() {
-            // Gather the soft values of the outputs actually transmitted.
+            // Gather the soft values of the outputs actually transmitted. Outputs b₄
+            // and b₅ (mode E's rate 1/6) repeat the generators of b₁ and b₂, so their
+            // metrics add to those.
             let mut m = [BitMetric::ERASURE; 4];
-            for (j, mj) in m.iter_mut().enumerate() {
+            for j in 0..6 {
                 if mask & (1 << j) != 0 {
-                    *mj = metrics.get(pos).copied().unwrap_or(BitMetric::ERASURE);
+                    let v = metrics.get(pos).copied().unwrap_or(BitMetric::ERASURE);
                     pos += 1;
+                    let t = if j < 4 { j } else { j - 3 };
+                    m[t].to0 += v.to0;
+                    m[t].to1 += v.to1;
                 }
             }
             for (w, wm) in word_metric.iter_mut().enumerate() {
@@ -136,7 +141,8 @@ mod tests {
 
     #[test]
     fn decodes_every_code_rate_error_free() {
-        for rate in 0..13 {
+        for rate in 0..crate::tables::CODE_RATES.len() {
+
             let s = spec(96, 500, rate, rate);
             let masks = mask_table(&s);
             let bits: Vec<u8> = (0..596u32).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8 & 1).collect();

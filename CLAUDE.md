@@ -1,6 +1,8 @@
 # DecDRM — notes for Claude
 
-Rust DRM30 (Digital Radio Mondiale, modes A–D) receiver + transmitter. Read
+Rust DRM30 (Digital Radio Mondiale, modes A–D) and DRM+ (mode E, 100 kHz, run at
+192 kHz: `RobustnessMode::sample_rate`, `ReceiverConfig::drm_plus`) receiver +
+transmitter. Read
 `docs/DESIGN.md` first: it records the user's decisions, the architecture and the
 milestone checklist (keep it current).
 

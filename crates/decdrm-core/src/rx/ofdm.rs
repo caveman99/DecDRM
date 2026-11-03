@@ -21,7 +21,7 @@ pub struct OfdmDemod {
 impl OfdmDemod {
     pub fn new(map: &CellMap) -> Self {
         let n = map.mode().fft_size();
-        let sym_rate = f64::from(crate::params::SAMPLE_RATE) / map.mode().symbol_len() as f64;
+        let sym_rate = f64::from(map.mode().sample_rate()) / map.mode().symbol_len() as f64;
         Self {
             fft: Fft::new(n),
             n,
@@ -31,6 +31,12 @@ impl OfdmDemod {
             power: vec![0.0; n],
             lambda: crate::dsp::iir1_lambda(1.0, sym_rate),
         }
+    }
+
+    /// The whole (unnormalised) FFT output of the last window, bin k mod N for carrier
+    /// k (mode E's frame sync searches its carrier offset in it).
+    pub fn spectrum(&self) -> &[Cplx] {
+        &self.work
     }
 
     /// Demodulate one window of `N` samples into `num_carriers` cells (index c =

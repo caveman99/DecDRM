@@ -5,7 +5,7 @@
 #   scripts/smoke-test.sh BIN_DIR OUT_DIR [--dac]
 #
 # BIN_DIR holds decdrm and decdrm-gui. The CLI transmits the example station (HE-AAC
-# audio, Journaline, EPG) and receives it, and the GUI decodes the same file and saves
+# audio, Journaline, EPG) and the DRM+ example and receives them, and the GUI decodes the same file and saves
 # a screenshot: headless under xvfb-run on Linux; on Windows it needs an OpenGL driver
 # (Mesa on GitHub's runners). --dac: a DAC station too, received in an empty directory
 # without DECDRM_MODELS, so the executables need the weights built in (feature
@@ -43,6 +43,11 @@ echo "== HE-AAC, Journaline and EPG: transmit, receive"
 "$bin/decdrm" rx aac.wav --data-dir "$out/data" | tee "$out/rx_aac.txt"
 grep -E "audio .*: [1-9][0-9]* frames ok, 0 concealed" "$out/rx_aac.txt"
 ls -R "$out/data"
+
+echo "== DRM+ (mode E): transmit, receive"
+"$bin/decdrm" tx "$repo/crates/decdrm-station/examples/drm_plus.toml" --duration 6 --status-every 0 --output plus.wav
+"$bin/decdrm" rx plus.wav --format iq --drm-plus | tee "$out/rx_plus.txt"
+grep -E "audio .*: [1-9][0-9]* frames ok, 0 concealed" "$out/rx_plus.txt"
 
 if $dac; then
     echo "== DAC from the built-in weights: transmit, receive"

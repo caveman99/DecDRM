@@ -30,6 +30,7 @@ fn main() {
                     let fac = Fac {
                         channel: ChannelParams {
                             enhancement: false,
+                            mode_e: false,
                             frame_index: 0,
                             afs_valid: false,
                             occupancy: so,
@@ -50,6 +51,7 @@ fn main() {
                             descriptor: 0,
                             data_ca: false,
                         },
+                        service2: None,
                     };
                     let msc = rng.bits(cap.total_bits());
                     let sdc = (tx.frame_index() == 0).then(|| rng.bytes(tx.sdc_capacity_bytes()));

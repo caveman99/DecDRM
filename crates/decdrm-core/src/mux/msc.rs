@@ -244,7 +244,7 @@ mod tests {
                 StreamLengths { part_a: 0, part_b: 40 },
             ];
             let part_a: usize = streams.iter().map(|s| s.part_a).sum();
-            let params = MlcParams::msc(mapping, n_mux, prot, part_a);
+            let params = MlcParams::msc(crate::params::RobustnessMode::B, mapping, n_mux, prot, part_a);
             let mux = if hier {
                 let v = params.bits_vspp / 8 - 1;
                 MultiplexDescription::new_hierarchical(0, 1, 1, v, &streams)

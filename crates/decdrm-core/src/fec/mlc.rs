@@ -11,13 +11,22 @@ use super::qam::{EqCell, Mapping, MetricKind};
 use super::viterbi::ViterbiDecoder;
 use super::BitMetric;
 use crate::Cplx;
+use crate::params::RobustnessMode;
 use crate::tables::{
-    BIT_INTERLEAVER_T0, CODE_RATES, FAC_RATE, MSC16_SM, MSC64_HMMIX, MSC64_HMSYM, MSC64_SM,
-    NUM_FAC_CELLS, PunctureMask, SDC4_RATE, SDC16_RATES,
+    BIT_INTERLEAVER_T0, CODE_RATES, FAC_RATE, FAC_RATE_E, MSC4_E, MSC16_E, MSC16_SM, MSC64_HMMIX, MSC64_HMSYM,
+    MSC64_SM, PunctureMask, SDC4_RATE, SDC16_RATES, num_fac_cells,
 };
 
-/// Number of FAC information bits per frame (incl. CRC) (§7.5.3).
+/// Number of FAC information bits per frame (incl. CRC) in modes A–D (§7.2.1.2).
 pub const FAC_BITS: usize = 72;
+/// Number of FAC information bits per frame in mode E (two sets of service
+/// parameters, §7.2.1.2).
+pub const FAC_BITS_E: usize = 116;
+
+/// FAC information bits per frame (L_FAC) of a robustness mode.
+pub const fn fac_bits(mode: RobustnessMode) -> usize {
+    if mode.is_drm_plus() { FAC_BITS_E } else { FAC_BITS }
+}
 
 /// Protection levels of the MSC (from the SDC multiplex description, §6.4.3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -76,22 +85,19 @@ fn floor_bits(idx: usize, coded: i64) -> usize {
 }
 
 impl MlcParams {
-    /// FAC: 4-QAM, R = 0.6, 72 bits in 65 cells.
-    pub fn fac() -> Self {
+    /// FAC: 4-QAM, R = 0.6, 72 bits in 65 cells (modes A–D), or R = 0.25, 116 bits in
+    /// 244 cells (mode E).
+    pub fn fac(mode: RobustnessMode) -> Self {
+        let (cells, bits) = (num_fac_cells(mode), fac_bits(mode));
+        let rate = if mode.is_drm_plus() { FAC_RATE_E } else { FAC_RATE };
         Self {
             mapping: Mapping::Qam4,
-            cells: NUM_FAC_CELLS,
+            cells,
             n1: 0,
-            n2: NUM_FAC_CELLS,
-            levels: vec![LevelParams {
-                bits_a: 0,
-                bits_b: FAC_BITS,
-                rate_a: 0,
-                rate_b: FAC_RATE,
-                interleaver: Some(1),
-            }],
+            n2: cells,
+            levels: vec![LevelParams { bits_a: 0, bits_b: bits, rate_a: 0, rate_b: rate, interleaver: Some(1) }],
             bits_hpp: 0,
-            bits_lpp: FAC_BITS,
+            bits_lpp: bits,
             bits_vspp: 0,
             tail_rule: TailRule::Standard,
             is_fac: true,
@@ -100,13 +106,19 @@ impl MlcParams {
 
     /// SDC with 4-QAM (R = 0.5) or 16-QAM (R = 0.5) over `n_sdc` cells.
     pub fn sdc(mapping: Mapping, n_sdc: usize) -> Self {
+        Self::sdc_with_rate(mapping, n_sdc, SDC4_RATE)
+    }
+
+    /// SDC as [`Self::sdc`], 4-QAM with the code rate `rate4` (an index into
+    /// `CODE_RATES`; mode E's SDC mode 1 uses R = 0.25).
+    pub fn sdc_with_rate(mapping: Mapping, n_sdc: usize, rate4: usize) -> Self {
         let coded = 2 * n_sdc as i64 - 12;
         let levels = match mapping {
             Mapping::Qam4 => vec![LevelParams {
                 bits_a: 0,
-                bits_b: floor_bits(SDC4_RATE, coded),
+                bits_b: floor_bits(rate4, coded),
                 rate_a: 0,
-                rate_b: SDC4_RATE,
+                rate_b: rate4,
                 interleaver: Some(1),
             }],
             Mapping::Qam16 => SDC16_RATES
@@ -138,8 +150,15 @@ impl MlcParams {
     }
 
     /// MSC over `n_mux` cells. `part_a_bytes` is the total length of the higher
-    /// protected parts of all streams (bytes per multiplex frame).
-    pub fn msc(mapping: Mapping, n_mux: usize, prot: MscProtection, part_a_bytes: usize) -> Self {
+    /// protected parts of all streams (bytes per multiplex frame). Mode E has its own
+    /// code rates (tables 29 and 31) and is the only mode with a 4-QAM MSC.
+    pub fn msc(
+        mode: RobustnessMode,
+        mapping: Mapping,
+        n_mux: usize,
+        prot: MscProtection,
+        part_a_bytes: usize,
+    ) -> Self {
         let x = 8.0 * part_a_bytes as f64;
         // N₁ = ⌈8X / (k·RYlcm·ΣR_p)⌉ · RYlcm, with k = 2 (1 for HMmix).
         let n1_for = |rates: &[usize], rylcm: usize, k: f64| -> usize {
@@ -157,8 +176,16 @@ impl MlcParams {
         };
 
         let (n1, levels, tail_rule, vspp) = match mapping {
-            Mapping::Qam16 | Mapping::Qam64Sm => {
-                let (ra, rb, rylcm): (Vec<usize>, Vec<usize>, usize) = if mapping == Mapping::Qam16 {
+            Mapping::Qam4 | Mapping::Qam16 | Mapping::Qam64Sm => {
+                let (ra, rb, rylcm): (Vec<usize>, Vec<usize>, usize) = if mapping == Mapping::Qam4 {
+                    let a = MSC4_E[prot.part_a.min(3)];
+                    let b = MSC4_E[prot.part_b.min(3)];
+                    (vec![a], vec![b], CODE_RATES[a].ry)
+                } else if mapping == Mapping::Qam16 && mode.is_drm_plus() {
+                    let a = MSC16_E[prot.part_a.min(3)];
+                    let b = MSC16_E[prot.part_b.min(3)];
+                    (a.0.to_vec(), b.0.to_vec(), a.1)
+                } else if mapping == Mapping::Qam16 {
                     let a = MSC16_SM[prot.part_a.min(1)];
                     let b = MSC16_SM[prot.part_b.min(1)];
                     (a.0.to_vec(), b.0.to_vec(), a.1)
@@ -171,7 +198,7 @@ impl MlcParams {
                 let n2 = n_mux - n1;
                 let levels = (0..ra.len())
                     .map(|j| LevelParams {
-                        bits_a: (2.0 * n1 as f64 * rate_of(ra[j])) as usize,
+                        bits_a: 2 * n1 * CODE_RATES[ra[j]].rx / CODE_RATES[ra[j]].ry,
                         bits_b: floor_bits(rb[j], 2 * n2 as i64 - 12),
                         rate_a: ra[j],
                         rate_b: rb[j],
@@ -230,7 +257,6 @@ impl MlcParams {
                 let vspp = levels[0].bits_b;
                 (n1, levels, TailRule::HmMix, vspp)
             }
-            Mapping::Qam4 => panic!("DRM30 MSC does not use 4-QAM"),
         };
 
         let first = if vspp > 0 { 1 } else { 0 };
@@ -503,7 +529,38 @@ mod tests {
 
     #[test]
     fn fac_roundtrip() {
-        roundtrip(MlcParams::fac(), 0);
+        roundtrip(MlcParams::fac(RobustnessMode::B), 0);
+        roundtrip(MlcParams::fac(RobustnessMode::E), 0);
+    }
+
+    /// Mode E: SDC and MSC block sizes of ES 201 980 annex J (tables J.5, J.10), and
+    /// round trips of every MSC constellation and protection level.
+    #[test]
+    fn mode_e_block_sizes_and_roundtrips() {
+        let map = CellMap::new(RobustnessMode::E, SpectrumOccupancy::SO_0).unwrap();
+        let n_sdc = map.sdc_cells_per_superframe;
+        assert_eq!(MlcParams::sdc_with_rate(Mapping::Qam4, n_sdc, SDC4_RATE).total_bits(), 930);
+        assert_eq!(MlcParams::sdc_with_rate(Mapping::Qam4, n_sdc, crate::tables::SDC4_RATE_ROBUST).total_bits(), 465);
+        let n = map.msc_cells_per_frame;
+        let eep = |mapping, level| {
+            let prot = MscProtection { part_a: level, part_b: level, hierarchical: 0 };
+            MlcParams::msc(RobustnessMode::E, mapping, n, prot, 0).total_bits()
+        };
+        let got: Vec<usize> = (0..4).map(|l| eep(Mapping::Qam16, l)).chain((0..4).map(|l| eep(Mapping::Qam4, l))).collect();
+        assert_eq!(got, [9938, 12243, 14907, 18635, 3727, 4969, 5962, 7454]);
+        for mapping in [Mapping::Qam4, Mapping::Qam16] {
+            for pa in 0..4 {
+                for pb in 0..4 {
+                    for part_a in [0usize, 100, 333] {
+                        let prot = MscProtection { part_a: pa, part_b: pb, hierarchical: 0 };
+                        roundtrip(MlcParams::msc(RobustnessMode::E, mapping, n, prot, part_a), 1);
+                    }
+                }
+            }
+            for so in [crate::tables::SDC4_RATE, crate::tables::SDC4_RATE_ROBUST] {
+                roundtrip(MlcParams::sdc_with_rate(Mapping::Qam4, n_sdc, so), 0);
+            }
+        }
     }
 
     #[test]
@@ -528,7 +585,8 @@ mod tests {
                 for pb in 0..max_level {
                     for part_a in [0usize, 60, 200] {
                         let prot = MscProtection { part_a: pa, part_b: pb, hierarchical: (pa + pb) % 4 };
-                        roundtrip(MlcParams::msc(mapping, n, prot, part_a), 1);
+                        roundtrip(MlcParams::msc(RobustnessMode::B, mapping, n, prot, part_a), 1);
+
                     }
                 }
             }

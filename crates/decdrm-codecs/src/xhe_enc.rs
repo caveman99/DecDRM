@@ -265,9 +265,12 @@ pub struct XheAacConfig {
     /// 1 (mono) or 2 (stereo, one channel pair element).
     pub channels: u16,
     /// Length of the audio super frame in bytes: the MSC stream's bytes per 400 ms logical
-    /// frame, minus the 4 text-message bytes when the SDC text flag is set. The stream bit
-    /// rate is `20 · super_frame_bytes` bit/s.
+    /// frame (mode E: two 100 ms logical frames), minus the 4 text-message bytes of each
+    /// logical frame when the SDC text flag is set. The stream bit rate is
+    /// `20 · super_frame_bytes` bit/s (mode E: 40).
     pub super_frame_bytes: usize,
+    /// Duration of the audio super frame, ms: 400, or 200 in robustness mode E (§5.2).
+    pub super_frame_ms: u32,
     /// SBR ratio.
     pub sbr: XheSbrMode,
     /// Core coding mode.
@@ -299,6 +302,7 @@ impl XheAacConfig {
             sample_rate,
             channels,
             super_frame_bytes,
+            super_frame_ms: 400,
             sbr: XheSbrMode::Auto,
             coding_mode: XheCodingMode::FrequencyDomain,
             independent_interval: None,
@@ -307,9 +311,27 @@ impl XheAacConfig {
         }
     }
 
-    /// Stream bit rate in bit/s (`20 · super_frame_bytes`).
+    /// The same with audio super frames of `ms` milliseconds (200 in robustness mode E).
+    pub fn with_super_frame_ms(mut self, ms: u32) -> Self {
+        self.super_frame_ms = ms;
+        self
+    }
+
+    /// Stream bit rate per super-frame byte, bit/s (20 for 400 ms super frames, 40 for
+    /// 200 ms).
+    fn bits_per_byte(&self) -> i64 {
+        8000 / i64::from(self.super_frame_ms.max(1))
+    }
+
+    /// Average number of access units per audio super frame with `frame_len`-sample
+    /// frames.
+    fn frames_per_super_frame(&self, frame_len: usize) -> f64 {
+        f64::from(self.super_frame_ms) / 1000.0 * f64::from(self.sample_rate) / frame_len as f64
+    }
+
+    /// Stream bit rate in bit/s (`20 · super_frame_bytes`, mode E 40).
     pub fn bitrate(&self) -> u32 {
-        (self.super_frame_bytes as u32).saturating_mul(20)
+        (self.super_frame_bytes as u32).saturating_mul(self.bits_per_byte() as u32)
     }
 
     /// The SBR ratio used: the fixed one, or for [`XheSbrMode::Auto`] the one that gave the
@@ -379,11 +401,14 @@ impl XheAacConfig {
                         .into(),
                 ))
             }
-            XheSbrRatio::None if self.sample_rate > 32_000 => {
+            XheSbrRatio::None
+                if self.frames_per_super_frame(XheSbrRatio::None.frame_len())
+                    > XHE_AAC_MAX_FRAMES_PER_SUPER_FRAME as f64 =>
+            {
                 Err(CodecError::Unsupported(format!(
-                    "xHE-AAC without SBR at {} Hz would put more than 15 frames into a 400 ms \
+                    "xHE-AAC without SBR at {} Hz would put more than 15 frames into a {} ms \
                      super frame (ES 201 980 §5.3.1); use SBR",
-                    self.sample_rate
+                    self.sample_rate, self.super_frame_ms
                 )))
             }
             r => Ok(r),
@@ -404,7 +429,7 @@ impl XheAacConfig {
                 self.channels
             )));
         }
-        if self.super_frame_bytes > XHE_AAC_MAX_SUPER_FRAME_BYTES {
+        if self.super_frame_bytes as i64 * self.bits_per_byte() > 20 * XHE_AAC_MAX_SUPER_FRAME_BYTES as i64 {
             return Err(CodecError::InvalidConfig(format!(
                 "{} bytes per super frame exceed the xHE-AAC maximum of 163 920 bit/s \
                  ({XHE_AAC_MAX_SUPER_FRAME_BYTES} bytes)",
@@ -579,7 +604,7 @@ impl XheAacConfig {
         let fs = i64::from(self.sample_rate);
         let l = self.super_frame_bytes as i64;
         // Channel capacity per access unit, in bits·fs (see the module docs).
-        let cap_num = 20 * (l - 2) * frame_len as i64 - 32 * fs;
+        let cap_num = self.bits_per_byte() * (l - 2) * frame_len as i64 - 32 * fs;
         let avg_bits = cap_num as f64 / fs as f64;
         // libxaac runs a little below the channel rate: its own bit reservoir then keeps it
         // inside ours (both start full and have the same size); the difference is filled.
@@ -615,11 +640,12 @@ impl XheAacConfig {
         }
         if (au_min_bytes * 8) as f64 >= avg_bits {
             return Err(CodecError::InvalidConfig(format!(
-                "with {frame_len}-sample frames at {} Hz a 400 ms super frame holds {:.2} \
+                "with {frame_len}-sample frames at {} Hz a {} ms super frame holds {:.2} \
                  frames; the 15-frame limit of ES 201 980 §5.3.1 leaves no room for a bit \
                  reservoir (use SBR or a lower sampling rate)",
                 self.sample_rate,
-                0.4 * fs as f64 / frame_len as f64
+                self.super_frame_ms,
+                self.frames_per_super_frame(frame_len)
             )));
         }
         Ok(RatePlan {
@@ -739,7 +765,8 @@ impl XheAacEncoder {
         let core_bitrate = inp.i_bitrate.max(0) as u32;
 
         let fs_u = config.sample_rate;
-        let frames_per_sf = 2 * i64::from(fs_u) / (5 * frame_len as i64); // ⌊0.4·fs/F⌋
+        // ⌊T·fs/F⌋ for super frames of T = 0.4 s (mode E 0.2 s).
+        let frames_per_sf = i64::from(fs_u) * i64::from(config.super_frame_ms) / (1000 * frame_len as i64);
         let independent_interval = u64::from(
             config
                 .independent_interval
@@ -849,9 +876,9 @@ impl XheAacEncoder {
         self.frame_len
     }
 
-    /// Average number of access units per 400 ms audio super frame.
+    /// Average number of access units per audio super frame (400 ms, mode E 200 ms).
     pub fn frames_per_super_frame(&self) -> f64 {
-        0.4 * f64::from(self.config.sample_rate) / self.frame_len as f64
+        self.config.frames_per_super_frame(self.frame_len)
     }
 
     /// Channel capacity for access units in bit/s: the stream rate minus super-frame

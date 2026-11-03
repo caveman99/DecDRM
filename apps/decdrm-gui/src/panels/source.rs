@@ -125,6 +125,11 @@ pub fn show(
                 ui.checkbox(&mut settings.flip, "Flip").on_hover_text("Mirror the spectrum (e.g. LSB reception).");
                 ui.checkbox(&mut settings.auto_flip, "Auto-flip")
                     .on_hover_text("Also accept spectrally inverted signals during acquisition.");
+                if settings.source != SourceKind::Kiwi {
+                    ui.checkbox(&mut settings.drm_plus, "DRM+").on_hover_text(
+                        "Receive DRM+ (robustness mode E, 100 kHz, VHF) instead of DRM30: the input is taken at                          192 kHz, I/Q with the signal near 0 Hz or a real IF centred at 48 kHz.",
+                    );
+                }
             }
             let mdi_recording = settings.source == SourceKind::Mdi
                 && decdrm_engine::decdrm_mdi::file::has_recording_extension(Path::new(settings.mdi.origin.trim()));

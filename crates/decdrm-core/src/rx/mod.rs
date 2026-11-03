@@ -1,8 +1,8 @@
-//! The DRM30 receiver chain.
+//! The DRM receiver chain.
 //!
 //! [`Receiver`] is push-driven: feed it interleaved sound-card / file samples at
-//! 48 kHz with [`Receiver::push`] and collect [`ReceiverEvent`]s. Internally the
-//! stages are:
+//! 48 kHz (DRM+: 192 kHz, see [`ReceiverConfig::drm_plus`]) with [`Receiver::push`] and
+//! collect [`ReceiverEvent`]s. Internally the stages are:
 //!
 //! ```text
 //! input ─▶ SRO resampler ─▶ frequency acquisition / mixer ─▶ time sync (mode,
@@ -13,6 +13,11 @@
 //! with feedback of the frequency offset (pilots → mixer), timing (impulse
 //! response → time sync) and sample-rate offset (impulse-response drift →
 //! resampler), mirroring Dream's `CDRMReceiver`.
+//!
+//! DRM+ (robustness mode E) has no frequency references to search for: the receiver
+//! starts with the DC carrier at 0 Hz (I/Q input) or fs/4 (real input), the cyclic
+//! prefix gives timing and the frequency within half a carrier spacing, and the frame
+//! sync finds the whole-carrier offset with the time references (`framesync`).
 
 pub mod chanest;
 pub mod diversity;
@@ -34,7 +39,7 @@ pub use input::{InputFormat, RealChannel};
 use crate::dsp::resampler::FracResampler;
 use crate::fac::{ChannelParams, Fac};
 use crate::fec::qam::MetricKind;
-use crate::params::{RobustnessMode, SAMPLE_RATE, SpectrumOccupancy};
+use crate::params::{RobustnessMode, SpectrumOccupancy};
 use crate::{Cplx, Real};
 use chain::SymbolChain;
 use freqacq::FreqAcquisition;
@@ -43,7 +48,9 @@ use std::collections::VecDeque;
 use std::f64::consts::PI;
 use timesync::{TimeSync, TimeSyncEvent};
 
-/// Symbols of time sync without a valid FAC before restarting acquisition.
+/// Symbols of time sync without a valid FAC before restarting acquisition (4 s in
+/// mode B; mode E, with ten times the symbol rate, waits as long: see
+/// [`symbols_without_fac_limit`]).
 const MAX_SYMBOLS_WITHOUT_FAC: usize = 150;
 /// A frequency acquisition that no FAC has confirmed yet is dropped at once when the
 /// input power rises this many times (10 dB) above its level during the search: the
@@ -54,8 +61,19 @@ const MAX_SYMBOLS_WITHOUT_FAC: usize = 150;
 const ACQ_POWER_JUMP: Real = 10.0;
 /// The rise must last this long, s (a click is not a signal).
 const ACQ_POWER_JUMP_S: Real = 0.05;
-/// Consecutive bad FACs (while locked) before restarting acquisition.
+/// Consecutive bad FACs (while locked) before restarting acquisition (4 s; mode E has
+/// four times the frames, see [`bad_facs_limit`]).
 const MAX_BAD_FACS_LOCKED: usize = 10;
+
+/// [`MAX_SYMBOLS_WITHOUT_FAC`] for `mode`: as many symbols as last 4 s.
+fn symbols_without_fac_limit(mode: RobustnessMode) -> usize {
+    if mode.is_drm_plus() { MAX_SYMBOLS_WITHOUT_FAC * 4 * 40 / 15 } else { MAX_SYMBOLS_WITHOUT_FAC }
+}
+
+/// [`MAX_BAD_FACS_LOCKED`] for `mode`: as many frames as last 4 s.
+fn bad_facs_limit(mode: RobustnessMode) -> usize {
+    MAX_BAD_FACS_LOCKED * if mode.is_drm_plus() { 4 } else { 1 }
+}
 /// Timing-loss detection from the cyclic-prefix correlation (a timing jump, e.g.
 /// samples lost or inserted by a network stream, makes it collapse while the input
 /// power stays; a fade lowers both). Averaging lengths in symbols:
@@ -103,6 +121,21 @@ pub struct ReceiverConfig {
     /// A branch of diversity reception: hand the equalised MSC cells out per multiplex
     /// frame ([`ReceiverEvent::MscCells`]) for the combiner instead of decoding them.
     pub diversity_branch: bool,
+    /// Receive DRM+ (robustness mode E, 100 kHz wide) instead of DRM30: the input is
+    /// then pushed at 192 kHz ([`crate::params::DRM_PLUS_SAMPLE_RATE`]).
+    pub drm_plus: bool,
+}
+
+impl ReceiverConfig {
+    /// The rate [`Receiver::push`] expects, Hz: 48 kHz, or 192 kHz for DRM+.
+    pub fn sample_rate(&self) -> u32 {
+        self.initial_mode().sample_rate()
+    }
+
+    /// The mode the receiver starts with (B; E for DRM+).
+    fn initial_mode(&self) -> RobustnessMode {
+        if self.drm_plus { RobustnessMode::E } else { RobustnessMode::B }
+    }
 }
 
 /// The default MSC soft metric: the Huber shape with Dream's amplitude weighting and a
@@ -125,6 +158,7 @@ impl Default for ReceiverConfig {
             msc_iterations: 2,
             metric: MSC_METRIC,
             diversity_branch: false,
+            drm_plus: false,
         }
     }
 }
@@ -151,7 +185,7 @@ pub struct RxStatus {
     /// With an inverted spectrum the carriers above it are the lower ones.
     pub dc_frequency_hz: Option<Real>,
     pub inverted: bool,
-    /// Sample-rate offset being corrected (Hz at 48 kHz).
+    /// Sample-rate offset being corrected (Hz at the working rate, 48 kHz or 192 kHz).
     pub sro_hz: Real,
     pub snr_db: Option<Real>,
     pub mer_db: Option<Real>,
@@ -289,6 +323,8 @@ impl InputSpectrum {
 
 pub struct Receiver {
     cfg: ReceiverConfig,
+    /// Working sample rate, Hz (48 kHz, DRM+ 192 kHz).
+    fs: Real,
     input: InputConverter,
     conv: Vec<Cplx>,
     resampler: FracResampler,
@@ -336,11 +372,13 @@ impl Receiver {
     pub fn new(cfg: ReceiverConfig) -> Self {
         let input = InputConverter::new(cfg.input, cfg.channels, cfg.flip);
         let real = input.is_real();
-        let mode = RobustnessMode::B;
+        let mode = cfg.initial_mode();
+        let fs = Real::from(cfg.sample_rate());
         Self {
-            acq: Some(FreqAcquisition::new(real, cfg.auto_flip)),
+            acq: (!cfg.drm_plus).then(|| FreqAcquisition::new(real, cfg.auto_flip)),
             acq_power: None,
             loud_samples: 0,
+            fs,
             input,
             conv: Vec::new(),
             resampler: FracResampler::new(),
@@ -348,7 +386,7 @@ impl Receiver {
             res: Vec::new(),
             pending: Vec::new(),
             conj: false,
-            dc_hz: 0.0,
+            dc_hz: Self::initial_dc_hz(&cfg, real),
             track_hz: 0.0,
             nco_phase: 0.0,
             mixed: Vec::new(),
@@ -377,6 +415,12 @@ impl Receiver {
 
     pub fn config(&self) -> &ReceiverConfig {
         &self.cfg
+    }
+
+    /// Where a DRM+ receiver first assumes the DC carrier: 0 Hz on I/Q input, fs/4 (the
+    /// middle of the band) on real input. DRM30 searches for it instead.
+    fn initial_dc_hz(cfg: &ReceiverConfig, real: bool) -> Real {
+        if cfg.drm_plus && real { Real::from(cfg.sample_rate()) / 4.0 } else { 0.0 }
     }
 
     pub fn status(&self) -> &RxStatus {
@@ -410,9 +454,9 @@ impl Receiver {
             spectrum_db: self.spectrum.db(),
             waterfall_rows: self.spectrum.rows.iter().cloned().collect(),
             spectrum_seq: self.spectrum.count,
-            spectrum_row_s: InputSpectrum::LEN as Real / Real::from(SAMPLE_RATE),
+            spectrum_row_s: InputSpectrum::LEN as Real / self.fs,
             spectrum_centre_hz: 0.0,
-            spectrum_span_hz: Real::from(SAMPLE_RATE),
+            spectrum_span_hz: self.fs,
             real_input: self.input.is_real(),
             dc_hz,
             signal_band_hz,
@@ -433,13 +477,16 @@ impl Receiver {
     /// Restart acquisition from scratch (e.g. after retuning).
     pub fn restart(&mut self) {
         let real = self.input.is_real();
-        self.acq = Some(FreqAcquisition::new(real, self.cfg.auto_flip));
+        self.acq = (!self.cfg.drm_plus).then(|| FreqAcquisition::new(real, self.cfg.auto_flip));
         self.acq_power = None;
         self.loud_samples = 0;
         self.pending.clear();
         self.conj = false;
         self.track_hz = 0.0;
-        self.mode = RobustnessMode::B;
+        if self.cfg.drm_plus {
+            self.dc_hz = Self::initial_dc_hz(&self.cfg, real);
+        }
+        self.mode = self.cfg.initial_mode();
         self.timesync.restart(self.mode);
         self.chain = None;
         self.state = RxState::Acquisition;
@@ -458,7 +505,7 @@ impl Receiver {
     /// Change the sample-rate correction. Frequencies at the resampler output scale
     /// with (fs - sro), so the mixer frequency is rescaled to stay on the signal.
     fn set_sro(&mut self, new_sro: Real) {
-        let fs = Real::from(SAMPLE_RATE);
+        let fs = self.fs;
         let new_sro = new_sro.clamp(-MAX_SRO_HZ, MAX_SRO_HZ);
         let scale = (fs - new_sro) / (fs - self.sro_hz);
         self.dc_hz *= scale;
@@ -466,8 +513,8 @@ impl Receiver {
         self.sro_hz = new_sro;
     }
 
-    /// Feed interleaved samples (any number of frames) at 48 kHz and return the
-    /// events produced.
+    /// Feed interleaved samples (any number of frames) at 48 kHz (DRM+: 192 kHz) and
+    /// return the events produced.
     pub fn push(&mut self, interleaved: &[f32]) -> Vec<ReceiverEvent> {
         let ch = self.cfg.channels.max(1);
         // Small chunks keep the feedback loops responsive.
@@ -483,7 +530,7 @@ impl Receiver {
         self.input.process(chunk, &mut self.conv);
         self.spectrum.push(&self.conv);
         self.res.clear();
-        let fs = Real::from(SAMPLE_RATE);
+        let fs = self.fs;
         let sro = self.sro_hz.clamp(-MAX_SRO_HZ, MAX_SRO_HZ);
         let ratio = fs / (fs - sro);
         self.resampler.process(&self.conv, ratio, &mut self.res);
@@ -535,8 +582,7 @@ impl Receiver {
         // Process in pieces so frequency corrections take effect quickly.
         for piece in samples.chunks(256) {
             self.mixed.clear();
-            let fs = Real::from(SAMPLE_RATE);
-            let w = 2.0 * PI * (self.dc_hz + self.track_hz) / fs;
+            let w = 2.0 * PI * (self.dc_hz + self.track_hz) / self.fs;
             for &s in piece {
                 let s = if self.conj { s.conj() } else { s };
                 self.mixed.push(s * Cplx::from_polar(1.0, -self.nco_phase));
@@ -572,12 +618,18 @@ impl Receiver {
 
     fn process_window(&mut self, win: timesync::SymbolWindow) {
         if self.chain.is_none() {
-            let so = SpectrumOccupancy::SO_3;
+            // DRM30 starts with 10 kHz until the FAC tells; mode E has nothing else.
+            let so = if self.mode.is_drm_plus() { SpectrumOccupancy::SO_0 } else { SpectrumOccupancy::SO_3 };
             self.chain = SymbolChain::new(self.mode, so, &self.cfg);
             self.sro_reports = 0;
             self.sro_prev = None;
             if let Some(c) = self.chain.as_mut() {
                 c.set_msc_config(self.msc_config, self.cfg.metric);
+            }
+            if self.mode.is_drm_plus() {
+                // Mode E is not detected but given; report it as the guard
+                // correlation has found the symbols.
+                self.events.push(ReceiverEvent::ModeDetected(self.mode));
             }
         }
         if let Some(rho) = win.guard_corr {
@@ -610,7 +662,7 @@ impl Receiver {
                     && eps.abs() > SRO_ACQ_THRESHOLD
                     && (prev - eps).abs() < 0.25 * prev.abs().max(eps.abs())
                 {
-                    sro_delta += 0.5 * (prev + eps) * Real::from(SAMPLE_RATE);
+                    sro_delta += 0.5 * (prev + eps) * self.fs;
                     chain.reset_sro_estimate();
                     self.sro_reports = 0;
                     self.sro_prev = None;
@@ -664,7 +716,8 @@ impl Receiver {
                 chain::ChainEvent::FrameIdentity(trusted) => self.events.push(ReceiverEvent::FrameIdentity { trusted }),
                 chain::ChainEvent::Msc(m) => self.events.push(ReceiverEvent::Msc(m)),
                 chain::ChainEvent::MscCells { cells, index, gap, carriers, kmin } => {
-                    let time_s = self.samples_in as Real / Real::from(SAMPLE_RATE);
+                    let time_s = self.samples_in as Real / self.fs;
+
                     self.events.push(ReceiverEvent::MscCells(MscCells { cells, index, gap, time_s, carriers, kmin }));
                 }
             }
@@ -678,7 +731,7 @@ impl Receiver {
 
         if self.state == RxState::Acquisition {
             self.symbols_without_fac += 1;
-            if self.symbols_without_fac > MAX_SYMBOLS_WITHOUT_FAC {
+            if self.symbols_without_fac > symbols_without_fac_limit(self.mode) {
                 self.restart();
                 self.events.push(ReceiverEvent::Restarted);
             }
@@ -744,7 +797,7 @@ impl Receiver {
         if self.bad_facs >= CP_LOSS_BAD_FACS && self.cp.lost_symbols >= CP_LOSS_SYMBOLS {
             self.resync();
             self.events.push(ReceiverEvent::Resynchronising);
-        } else if self.bad_facs > MAX_BAD_FACS_LOCKED {
+        } else if self.bad_facs > bad_facs_limit(self.mode) {
             self.restart();
             self.events.push(ReceiverEvent::Restarted);
         }

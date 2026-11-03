@@ -5,16 +5,22 @@
 //! The input is the complex baseband signal with the DRM DC carrier at 0 Hz. For the
 //! correlations it is low-pass filtered to ±4.5 kHz and decimated by 4 (12 kHz),
 //! like Dream's "10 kHz Hilbert filter" path.
+//!
+//! Mode E (DRM+, 192 kHz) has nothing to detect: its guard correlation runs on the
+//! full-rate signal (the guard is only 48 samples) and gives the timing alone.
 
 use super::super::dsp::fir::{FirDecimator, lowpass};
 use crate::params::RobustnessMode;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 
-/// Decimation factor of the correlation path.
+/// Decimation factor of the correlation path (DRM30).
 const DEC: usize = 4;
-/// Guard correlation is evaluated every `STEP` decimated samples.
+/// Guard correlation is evaluated every `STEP` decimated samples (DRM30).
 const STEP: usize = 4;
+/// Mode E: no decimation, an evaluation every other sample (1/24 of the guard).
+const DEC_E: usize = 1;
+const STEP_E: usize = 2;
 /// Robustness-mode detection observes this many symbols.
 const RM_BLOCKS: usize = 16;
 /// Required ratio between best and second-best mode score (Dream: 8). Measured on
@@ -31,6 +37,8 @@ const RM_RELIABILITY_LONG: Real = 5.0;
 const LAMBDA_START: Real = 0.99;
 /// Candidates further than this from the current estimate count as outliers.
 const TIMING_BOUND: Real = 150.0;
+/// The same for mode E (480-sample symbols).
+const TIMING_BOUND_E: Real = 60.0;
 /// After this many consecutive outliers the estimate jumps to their average.
 const OUTLIERS_BEFORE_RESET: usize = 5;
 
@@ -43,7 +51,8 @@ struct Geom {
 }
 
 fn geom(m: RobustnessMode) -> Geom {
-    Geom { nu: m.fft_size() / DEC, g: m.guard_len() / DEC, ts: m.symbol_len() / DEC }
+    let dec = if m.is_drm_plus() { DEC_E } else { DEC };
+    Geom { nu: m.fft_size() / dec, g: m.guard_len() / dec, ts: m.symbol_len() / dec }
 }
 
 /// One demodulation window: the useful part of an OFDM symbol.
@@ -60,6 +69,10 @@ pub struct SymbolWindow {
     /// right, near zero after a timing jump (e.g. samples lost by the input). `None`
     /// when the guard samples are no longer buffered.
     pub guard_corr: Option<Real>,
+    /// The same correlation as a complex value, Σ guard · conj(end of window) / power
+    /// (magnitude `guard_corr`): its phase is −2π·f·Tu for a frequency offset f, which
+    /// mode E (without frequency references) tracks.
+    pub guard_phasor: Option<Cplx>,
     /// Mean power of the window samples.
     pub power: Real,
 }
@@ -76,6 +89,11 @@ pub struct TimeSync {
     mode: RobustnessMode,
     fft_len: usize,
     sym_len: usize,
+    /// Decimation and evaluation step of the correlation path, and the outlier bound
+    /// (DRM30 or mode E values).
+    dec_factor: usize,
+    step: usize,
+    timing_bound: Real,
 
     // Full-rate sample buffer; buf[i] has absolute index buf_base + i.
     buf: Vec<Cplx>,
@@ -131,16 +149,24 @@ pub struct TimeSync {
 }
 
 impl TimeSync {
+    /// Time sync for DRM30 (any of modes A–D: the mode is detected) or for mode E.
     pub fn new(mode: RobustnessMode) -> Self {
-        // Pass ±4.5 kHz, stop from 7.5 kHz (aliases of 7.5–12 kHz land outside ±4.5 kHz
-        // after decimation to 12 kHz).
-        let taps = lowpass(97, 6000.0 / 48000.0, 60.0);
-        let lpf = FirDecimator::new(taps, DEC);
+        let drm_plus = mode.is_drm_plus();
+        let lpf = if drm_plus {
+            FirDecimator::new(vec![1.0], DEC_E)
+        } else {
+            // Pass ±4.5 kHz, stop from 7.5 kHz (aliases of 7.5–12 kHz land outside
+            // ±4.5 kHz after decimation to 12 kHz).
+            FirDecimator::new(lowpass(97, 6000.0 / 48000.0, 60.0), DEC)
+        };
         let lpf_delay = lpf.delay();
         let mut s = Self {
             mode,
             fft_len: mode.fft_size(),
             sym_len: mode.symbol_len(),
+            dec_factor: if drm_plus { DEC_E } else { DEC },
+            step: if drm_plus { STEP_E } else { STEP },
+            timing_bound: if drm_plus { TIMING_BOUND_E } else { TIMING_BOUND },
             buf: Vec::new(),
             buf_base: 0,
             lpf,
@@ -151,7 +177,7 @@ impl TimeSync {
             next_eval: 0,
             dec_origin: 0,
             dec_active: false,
-            mode_acq: true,
+            mode_acq: !drm_plus,
             rm_buf: Default::default(),
             rm_acc: [Cplx::new(0.0, 0.0); 4],
             rm_acc_long: [Cplx::new(0.0, 0.0); 4],
@@ -192,14 +218,15 @@ impl TimeSync {
         self.fft_len = mode.fft_size();
         self.sym_len = mode.symbol_len();
         let g = geom(mode);
-        let rm_len = RM_BLOCKS * g.ts / STEP;
+        let step = self.step;
+        let rm_len = RM_BLOCKS * g.ts / step;
         if rm_len != self.rm_len {
             self.reset_mode_detection();
         }
         self.rm_len = rm_len;
-        self.rm_len_long = RM_BLOCKS_LONG * g.ts / STEP;
-        self.maxdet_len = g.ts / STEP;
-        self.ma_len = (g.g / STEP).max(1);
+        self.rm_len_long = RM_BLOCKS_LONG * g.ts / step;
+        self.maxdet_len = g.ts / step;
+        self.ma_len = (g.g / step).max(1);
         self.corr_av = vec![0.0; self.maxdet_len];
         self.corr_av_idx = 0;
         self.lambda_co_av = 1.0;
@@ -214,9 +241,9 @@ impl TimeSync {
         self.last_start = None;
     }
 
-    /// Restart everything including robustness-mode detection.
+    /// Restart everything including robustness-mode detection (DRM30).
     pub fn restart(&mut self, mode: RobustnessMode) {
-        self.mode_acq = true;
+        self.mode_acq = !mode.is_drm_plus();
         self.reset_mode_detection();
         self.configure(mode);
     }
@@ -290,9 +317,12 @@ impl TimeSync {
     }
 
     fn evaluate(&mut self, events: &mut Vec<TimeSyncEvent>) {
-        let geoms: [Geom; 4] = RobustnessMode::ALL.map(geom);
+        // DRM30 correlates all four modes (for mode detection); mode E only itself.
+        let drm_plus = self.mode.is_drm_plus();
+        let geoms: [Geom; 4] = if drm_plus { [geom(self.mode); 4] } else { RobustnessMode::ALL.map(geom) };
+        let n_modes = if drm_plus { 1 } else { 4 };
         let span = geoms.iter().map(|g| g.g + g.nu).max().unwrap_or(0);
-        let sel = self.mode.index();
+        let sel = if drm_plus { 0 } else { self.mode.index() };
         let dec_end = self.dec_base + self.dec.len() as i64;
         if self.next_eval < self.dec_base {
             self.next_eval = self.dec_base;
@@ -301,7 +331,7 @@ impl TimeSync {
             let t = (self.next_eval - self.dec_base) as usize;
             let mut metric = [0.0; 4];
             let mut rho = [0.0; 4];
-            for (m, g) in geoms.iter().enumerate() {
+            for (m, g) in geoms.iter().enumerate().take(n_modes) {
                 let mut c = Cplx::new(0.0, 0.0);
                 let mut p = 0.0;
                 for i in 0..g.g {
@@ -348,7 +378,7 @@ impl TimeSync {
             if self.timing_acq {
                 self.timing_step(metric[sel], self.next_eval);
             }
-            self.next_eval += STEP as i64;
+            self.next_eval += self.step as i64;
         }
         // Drop decimated samples that are no longer needed.
         let drop = (self.next_eval - self.dec_base).max(0) as usize;
@@ -362,7 +392,7 @@ impl TimeSync {
     /// Add one normalised guard correlation per mode to the sliding DFTs.
     fn push_mode_values(&mut self, geoms: &[Geom; 4], rho: &[Real; 4]) {
         // exp(-j2π·f·n) at each mode's symbol rate f = STEP/ts cycles per evaluation,
-        // with the phase computed exactly from n mod ts.
+        // with the phase computed exactly from n mod ts. (DRM30 only.)
         let phasor = |g: &Geom, n: usize| {
             let k = (n * STEP) % g.ts;
             Cplx::from_polar(1.0, -2.0 * std::f64::consts::PI * k as Real / g.ts as Real)
@@ -444,7 +474,7 @@ impl TimeSync {
         let center = (self.maxdet_len - 1) / 2;
         if imax == center {
             let tpos = self.maxdet[center].1;
-            let candidate = (self.dec_origin + tpos * DEC as i64) as Real - self.lpf_delay;
+            let candidate = (self.dec_origin + tpos * self.dec_factor as i64) as Real - self.lpf_delay;
             self.timing_candidate(candidate);
         }
     }
@@ -462,7 +492,7 @@ impl TimeSync {
         if e >= ts / 2.0 {
             e -= ts;
         }
-        if e.abs() < TIMING_BOUND {
+        if e.abs() < self.timing_bound {
             self.next_start = Some(cur + (1.0 - LAMBDA_START) * e);
             self.outliers = 0;
             self.outlier_sum = 0.0;
@@ -507,7 +537,8 @@ impl TimeSync {
             return None;
         }
         let samples = self.buf[rel..rel + self.fft_len].to_vec();
-        let guard_corr = self.guard_correlation(rel);
+        let guard_phasor = self.guard_correlation(rel);
+        let guard_corr = guard_phasor.map(|c| c.norm());
         let power = samples.iter().map(|s| s.norm_sqr()).sum::<Real>() / samples.len().max(1) as Real;
         let shift = match self.last_start {
             Some(l) => start - (l + self.sym_len as i64),
@@ -522,15 +553,16 @@ impl TimeSync {
             self.buf.drain(..d);
             self.buf_base += d as i64;
         }
-        Some(SymbolWindow { samples, start, shift, guard_corr, power })
+        Some(SymbolWindow { samples, start, shift, guard_corr, guard_phasor, power })
     }
 
-    /// Best normalised cyclic-prefix correlation for the window at buffer index `rel`,
-    /// over guard placements within ±G/2 of the window start (the timing loop may park
-    /// the window anywhere in the guard, so the exact position is not a reference).
-    fn guard_correlation(&self, rel: usize) -> Option<Real> {
+    /// Best normalised cyclic-prefix correlation (complex, magnitude 0..=1) for the
+    /// window at buffer index `rel`, over guard placements within ±G/2 of the window
+    /// start (the timing loop may park the window anywhere in the guard, so the exact
+    /// position is not a reference).
+    fn guard_correlation(&self, rel: usize) -> Option<Cplx> {
         let g = self.sym_len - self.fft_len;
-        let mut best: Option<Real> = None;
+        let mut best: Option<Cplx> = None;
         for step in -4isize..=4 {
             let d = step * g as isize / 8;
             let first = rel as isize - g as isize + d;
@@ -545,11 +577,14 @@ impl TimeSync {
                 c += a * b.conj();
                 p += a.norm_sqr() + b.norm_sqr();
             }
-            let rho = if p > 0.0 { 2.0 * c.norm() / p } else { 0.0 };
-            best = Some(best.map_or(rho, |b: Real| b.max(rho)));
+            let rho = if p > 0.0 { 2.0 * c / p } else { Cplx::new(0.0, 0.0) };
+            if best.is_none_or(|b| rho.norm() > b.norm()) {
+                best = Some(rho);
+            }
         }
         best
     }
+
 
     /// Drop buffered samples when no timing exists yet (bounded memory).
     pub fn trim_unsynchronised(&mut self) {

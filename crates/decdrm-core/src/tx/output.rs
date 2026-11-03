@@ -23,7 +23,7 @@
 use super::TxError;
 use crate::cellmap::CellMap;
 use crate::dsp::fir::lowpass;
-use crate::params::{ChannelLayout, SAMPLE_RATE};
+use crate::params::ChannelLayout;
 use crate::{Cplx, Real};
 use std::f64::consts::PI;
 
@@ -31,11 +31,19 @@ use std::f64::consts::PI;
 pub const DEFAULT_LEVEL_DBFS: Real = -15.0;
 
 /// Pass band of the channel filter beyond the outermost carriers' main lobes, Hz
-/// (Dream's transmitter filter adds 300 Hz to the nominal bandwidth).
+/// (Dream's transmitter filter adds 300 Hz to the nominal bandwidth), at 48 kHz; it
+/// scales with the sample rate (600 Hz for mode E at 192 kHz).
 pub const BAND_MARGIN_HZ: Real = 150.0;
 
-/// Transition band of the channel filter, Hz.
+/// Transition band of the channel filter at 48 kHz, Hz; it scales with the sample rate
+/// like [`BAND_MARGIN_HZ`], which keeps the filter length.
 const TRANSITION_HZ: Real = 1000.0;
+
+/// Working sample rate of `layout`, Hz, and its ratio to 48 kHz.
+fn rate(layout: ChannelLayout) -> (Real, Real) {
+    let fs = Real::from(layout.mode.sample_rate());
+    (fs, fs / 48_000.0)
+}
 /// Stop-band attenuation of the channel filter, dB.
 const FILTER_ATTEN_DB: Real = 70.0;
 /// Keep the real-IF signal at least this far from 0 Hz and fs/2 (the receiver's
@@ -99,7 +107,7 @@ pub fn carrier_span_hz(layout: ChannelLayout) -> (Real, Real) {
 /// 18 and 20 kHz (most carriers lie above it).
 pub fn suggested_if_hz(layout: ChannelLayout) -> Real {
     let (lo, hi) = carrier_span_hz(layout);
-    let centre = Real::from(SAMPLE_RATE) / 4.0;
+    let centre = rate(layout).0 / 4.0;
     ((centre - (lo + hi) / 2.0) / 100.0).round() * 100.0
 }
 
@@ -109,7 +117,7 @@ pub fn suggested_if_hz(layout: ChannelLayout) -> Real {
 /// IF that keeps the carriers strictly inside 0..fs/2.
 pub fn recommended_if_range_hz(layout: ChannelLayout) -> (Real, Real) {
     let (lo, hi) = carrier_span_hz(layout);
-    let nyq = Real::from(SAMPLE_RATE) / 2.0;
+    let nyq = rate(layout).0 / 2.0;
     (((REAL_EDGE_GUARD_HZ - lo) / 100.0).ceil() * 100.0, ((nyq - REAL_EDGE_GUARD_HZ - hi) / 100.0).floor() * 100.0)
 }
 
@@ -157,15 +165,16 @@ struct BandFilter {
 
 impl BandFilter {
     fn new(layout: ChannelLayout) -> Self {
-        let fs = Real::from(SAMPLE_RATE);
+        let (fs, scale) = rate(layout);
+        let (margin, transition) = (BAND_MARGIN_HZ * scale, TRANSITION_HZ * scale);
         let (kmin, kmax) = layout.carrier_range();
         let df = layout.mode.carrier_spacing();
         let center = Real::from(kmin + kmax) / 2.0 * df;
         // Half-width including the outer carriers' main lobes (±Δf/2).
         let half = Real::from(kmax - kmin + 1) / 2.0 * df;
-        let cutoff = half + BAND_MARGIN_HZ + TRANSITION_HZ / 2.0;
+        let cutoff = half + margin + transition / 2.0;
         // Kaiser length estimate: N ≈ (A − 7.95) / (14.36·Δf/fs) + 1, made odd.
-        let len = ((FILTER_ATTEN_DB - 7.95) / (14.36 * TRANSITION_HZ / fs)).ceil() as usize + 1;
+        let len = ((FILTER_ATTEN_DB - 7.95) / (14.36 * transition / fs)).ceil() as usize + 1;
         let len = len | 1;
         let taps = lowpass(len, cutoff / fs, FILTER_ATTEN_DB);
         Self { fir: Fir::new(taps), center_step: 2.0 * PI * center / fs, phase: 0.0 }
@@ -207,7 +216,8 @@ impl OutputStage {
     /// if the signal would not fit into the output band (0..fs/2 for real output
     /// with a margin for the receiver's Hilbert filter, ±fs/2 for I/Q).
     pub fn new(layout: ChannelLayout, cfg: OutputConfig) -> Result<Self, TxError> {
-        let fs = Real::from(SAMPLE_RATE);
+        let fs = rate(layout).0;
+
         let (lo, hi) = carrier_span_hz(layout);
         let (shift, lo_limit, hi_limit) = match cfg.format {
             OutputFormat::Real { if_hz } => (if_hz, 0.0, fs / 2.0),

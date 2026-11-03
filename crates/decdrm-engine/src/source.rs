@@ -118,11 +118,14 @@ pub struct SourceInfo {
     pub is_file: bool,
 }
 
-/// An opened source producing 48 kHz frames.
+/// An opened source producing frames at the receiver's working rate (48 kHz, DRM+
+/// 192 kHz).
 pub struct Source {
     kind: Kind,
-    /// Conversion to 48 kHz; for a KiwiSDR made once it has reported its rate.
+    /// Conversion to the working rate; for a KiwiSDR made once it has reported its rate.
     to48: Option<To48k>,
+    /// The working rate, Hz.
+    rate: u32,
     info: SourceInfo,
     /// Frames delivered so far (at the source rate).
     pub frames_read: u64,
@@ -139,7 +142,9 @@ enum Kind {
 }
 
 impl Source {
-    pub fn open(spec: &InputSpec) -> Result<Self> {
+    /// Open `spec`, converting it to `rate` Hz (the receiver's working rate:
+    /// `ReceiverConfig::sample_rate`).
+    pub fn open(spec: &InputSpec, rate: u32) -> Result<Self> {
         let (kind, info) = match spec {
             InputSpec::File { path, .. } => {
                 let r = FileReader::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -156,7 +161,7 @@ impl Source {
             InputSpec::Device { name, channels } => {
                 let opts = InputOptions {
                     device: name.clone(),
-                    sample_rate: Some(48_000),
+                    sample_rate: Some(rate),
                     channels: *channels,
                     buffer: Duration::from_secs(3),
                 };
@@ -172,10 +177,10 @@ impl Source {
                 (Kind::Device(s), info)
             }
             InputSpec::Diversity(specs) => {
-                let a = Source::open(&specs[0]).context("opening the first input")?;
-                let b = Source::open(&specs[1]).context("opening the second input")?;
+                let a = Source::open(&specs[0], rate).context("opening the first input")?;
+                let b = Source::open(&specs[1], rate).context("opening the second input")?;
                 let info = SourceInfo { name: format!("{} + {}", a.info.name, b.info.name), ..a.info.clone() };
-                return Ok(Self { kind: Kind::Pair(Box::new([a, b]), [None, None]), to48: None, info, frames_read: 0 });
+                return Ok(Self { kind: Kind::Pair(Box::new([a, b]), [None, None]), to48: None, rate, info, frames_read: 0 });
             }
             InputSpec::Mdi(spec) => {
                 let input = MdiInput::open(spec.origin.clone(), spec.realtime)
@@ -199,7 +204,7 @@ impl Source {
                     log.push(format!("MDI/RSCI: RCI commands go to {}", r.destination()));
                 }
                 let kind = Kind::Mdi(Box::new(MdiSource { input, rci, frames: 0, protocol: None, rsci: RsciStatus::default(), log }));
-                return Ok(Self { kind, to48: None, info, frames_read: 0 });
+                return Ok(Self { kind, to48: None, rate, info, frames_read: 0 });
             }
             InputSpec::Kiwi(cfg) => {
                 // Connects in the background: `read` waits for the samples, so a stop
@@ -213,11 +218,11 @@ impl Source {
                     is_file: false,
                 };
                 let kind = Kind::Kiwi(KiwiStream::start(cfg.clone()), cfg.address.to_string());
-                return Ok(Self { kind, to48: None, info, frames_read: 0 });
+                return Ok(Self { kind, to48: None, rate, info, frames_read: 0 });
             }
         };
-        let to48 = To48k::new(info.sample_rate, info.channels).context("creating resampler")?;
-        Ok(Self { kind, to48: Some(to48), info, frames_read: 0 })
+        let to48 = To48k::to_rate(info.sample_rate, info.channels, rate).context("creating resampler")?;
+        Ok(Self { kind, to48: Some(to48), rate, info, frames_read: 0 })
     }
 
     pub fn info(&self) -> &SourceInfo {
@@ -419,7 +424,8 @@ impl Source {
                 if let Some(rate) = s.sample_rate() {
                     let rate = rate.round() as u32;
                     if self.to48.is_none() || rate != self.info.sample_rate {
-                        self.to48 = Some(To48k::new(rate, 2).context("creating resampler")?);
+                        self.to48 = Some(To48k::to_rate(rate, 2, self.rate).context("creating resampler")?);
+
                         self.info.sample_rate = rate;
                     }
                 }

@@ -22,6 +22,7 @@ fn test_fac(rng: &mut Rng) -> Fac {
     Fac {
         channel: ChannelParams {
             enhancement: false,
+            mode_e: false,
             frame_index: 0,
             afs_valid: true,
             // The transmitter overwrites occupancy, interleaving and the modes.
@@ -43,6 +44,7 @@ fn test_fac(rng: &mut Rng) -> Fac {
             descriptor: rng.below(32) as u8,
             data_ca: false,
         },
+        service2: None,
     }
 }
 

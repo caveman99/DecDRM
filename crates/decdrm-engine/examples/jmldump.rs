@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
     let iq = args.iter().any(|a| a == "iq");
     let out_path = args.iter().skip(2).find(|a| *a != "iq");
     let mut out = out_path.map(std::fs::File::create).transpose()?;
-    let mut source = Source::open(&InputSpec::File { path: path.into(), realtime: false })?;
+    let mut source = Source::open(&InputSpec::File { path: path.into(), realtime: false }, decdrm_core::params::SAMPLE_RATE)?;
     let channels = source.info().channels;
     let input = if iq { InputFormat::Iq { swap: false } } else { InputFormat::Real(RealChannel::Mix) };
     let mut rx = Receiver::new(ReceiverConfig { input, channels, ..Default::default() });

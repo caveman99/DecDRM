@@ -15,6 +15,7 @@ pub mod session;
 pub mod snapshot;
 pub mod source;
 
+pub use decdrm_core;
 pub use decdrm_core::rx::{InputFormat, RealChannel, ReceiverConfig};
 pub use decdrm_data;
 pub use decdrm_kiwi;
@@ -231,7 +232,7 @@ fn worker(
     ev_tx: &Sender<EngineEvent>,
     shared: &Arc<Mutex<Snapshot>>,
 ) -> Result<()> {
-    let mut source = Source::open(&cfg.input)?;
+    let mut source = Source::open(&cfg.input, cfg.receiver.sample_rate())?;
     let info = source.info().clone();
     let realtime = cfg.input.is_realtime();
     // The receiver configuration of an input (the channels it has; a KiwiSDR is I/Q).

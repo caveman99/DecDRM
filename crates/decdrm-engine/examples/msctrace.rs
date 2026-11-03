@@ -10,7 +10,7 @@ fn main() -> anyhow::Result<()> {
     let from: f64 = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0.0);
     let to: f64 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(f64::INFINITY);
     let iq = args.iter().any(|a| a == "iq");
-    let mut source = Source::open(&InputSpec::File { path: path.into(), realtime: false })?;
+    let mut source = Source::open(&InputSpec::File { path: path.into(), realtime: false }, decdrm_core::params::SAMPLE_RATE)?;
     let ch = source.info().channels;
     let input = if iq { InputFormat::Iq { swap: false } } else { InputFormat::Real(RealChannel::Mix) };
     let mut session = Session::new(ReceiverConfig { input, channels: ch, ..Default::default() });

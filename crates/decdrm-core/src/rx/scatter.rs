@@ -18,7 +18,7 @@
 
 use crate::cellmap::CellMap;
 use crate::dsp::fft::Fft;
-use crate::params::{RobustnessMode, SAMPLE_RATE};
+use crate::params::RobustnessMode;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 use std::f64::consts::PI;
@@ -79,6 +79,7 @@ pub(crate) struct ChannelHistory {
     stale: bool,
     kmin: i32,
     fft_size: usize,
+    spacing_hz: Real,
     symbol_s: Real,
     guard_ms: Real,
     doppler_max_hz: Real,
@@ -88,12 +89,13 @@ pub(crate) struct ChannelHistory {
 impl ChannelHistory {
     pub fn new(map: &CellMap) -> Self {
         let mode = map.mode();
-        let fs = Real::from(SAMPLE_RATE);
+        let fs = Real::from(mode.sample_rate());
         let symbol_s = mode.symbol_len() as Real / fs;
         let doppler_max_hz: Real = match mode {
             RobustnessMode::A | RobustnessMode::B => 5.0,
             RobustnessMode::C => 8.0,
             RobustnessMode::D => 10.0,
+            RobustnessMode::E => 50.0,
         };
         Self {
             rows: VecDeque::new(),
@@ -101,6 +103,7 @@ impl ChannelHistory {
             stale: false,
             kmin: map.kmin,
             fft_size: mode.fft_size(),
+            spacing_hz: mode.carrier_spacing(),
             symbol_s,
             guard_ms: mode.guard_len() as Real / fs * 1e3,
             doppler_max_hz: doppler_max_hz.min(0.45 / symbol_s),
@@ -140,6 +143,7 @@ impl ChannelHistory {
                 self.rows.make_contiguous(),
                 self.kmin,
                 self.fft_size,
+                self.spacing_hz,
                 self.symbol_s,
                 range,
                 self.doppler_max_hz,
@@ -166,6 +170,7 @@ pub fn delay_doppler(
     rows: &[(Vec<Cplx>, i64)],
     kmin: i32,
     fft_size: usize,
+    spacing_hz: Real,
     symbol_s: Real,
     delay_range_ms: (Real, Real),
     doppler_max_hz: Real,
@@ -176,7 +181,6 @@ pub fn delay_doppler(
         return None;
     }
     let newest = rows[t_len - 1].1;
-    let spacing_hz = Real::from(SAMPLE_RATE) / fft_size as Real;
 
     // Delay transform: twice the carriers (zero-padded), a power of two.
     let nd = (2 * n_car).next_power_of_two();
@@ -294,7 +298,7 @@ mod tests {
     #[test]
     fn paths_appear_at_their_delay_and_doppler() {
         let rows = rows(&[(0.5, 1.0, 1.0), (2.0, 0.5, -0.5)], 225, usize::MAX, 0);
-        let m = delay_doppler(&rows, KMIN, FFT, TS, (-1.33, 6.67), 5.0).unwrap();
+        let m = delay_doppler(&rows, KMIN, FFT, 48_000.0 / FFT as Real, TS, (-1.33, 6.67), 5.0).unwrap();
         let (tau, nu) = peak(&m);
         assert!((tau - 0.5).abs() < 0.06 && (nu - 1.0).abs() < 0.05, "strongest at {tau} ms, {nu} Hz");
         // The second path: about 6 dB down, at 2 ms and −0.5 Hz.
@@ -317,7 +321,7 @@ mod tests {
         // The window moves 10 samples (0.21 ms) later half-way: the path's delay in the
         // newest timing is 1.0 ms − 0.21 ms, and the spot stays sharp.
         let rows = rows(&[(1.0, 1.0, 0.3)], 225, 112, 10);
-        let m = delay_doppler(&rows, KMIN, FFT, TS, (-1.33, 6.67), 5.0).unwrap();
+        let m = delay_doppler(&rows, KMIN, FFT, 48_000.0 / FFT as Real, TS, (-1.33, 6.67), 5.0).unwrap();
         let (tau, nu) = peak(&m);
         let expected = 1.0 - 10.0 / 48.0;
         assert!((tau - expected).abs() < 0.06 && (nu - 0.3).abs() < 0.05, "at {tau} ms, {nu} Hz");
@@ -357,10 +361,10 @@ mod tests {
 
     #[test]
     fn too_little_to_go_on() {
-        assert!(delay_doppler(&[], KMIN, FFT, TS, (0.0, 5.0), 5.0).is_none());
+        assert!(delay_doppler(&[], KMIN, FFT, 48_000.0 / FFT as Real, TS, (0.0, 5.0), 5.0).is_none());
         let few = rows(&[(0.0, 1.0, 0.0)], 4, usize::MAX, 0);
-        assert!(delay_doppler(&few, KMIN, FFT, TS, (0.0, 5.0), 5.0).is_none());
+        assert!(delay_doppler(&few, KMIN, FFT, 48_000.0 / FFT as Real, TS, (0.0, 5.0), 5.0).is_none());
         let zeros = vec![(vec![Cplx::new(0.0, 0.0); N_CAR], 0); 50];
-        assert!(delay_doppler(&zeros, KMIN, FFT, TS, (0.0, 5.0), 5.0).is_none());
+        assert!(delay_doppler(&zeros, KMIN, FFT, 48_000.0 / FFT as Real, TS, (0.0, 5.0), 5.0).is_none());
     }
 }

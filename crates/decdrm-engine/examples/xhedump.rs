@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
     let path = args.get(1).expect("usage: xhedump FILE [iq] OUT_PREFIX");
     let iq = args.iter().any(|a| a == "iq");
     let prefix = args.iter().skip(2).find(|a| *a != "iq").expect("OUT_PREFIX");
-    let mut source = Source::open(&InputSpec::File { path: path.into(), realtime: false })?;
+    let mut source = Source::open(&InputSpec::File { path: path.into(), realtime: false }, decdrm_core::params::SAMPLE_RATE)?;
     let channels = source.info().channels;
     let input = if iq { InputFormat::Iq { swap: false } } else { InputFormat::Real(RealChannel::Mix) };
     let mut rx = Receiver::new(ReceiverConfig { input, channels, ..Default::default() });

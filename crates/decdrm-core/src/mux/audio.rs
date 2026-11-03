@@ -37,8 +37,14 @@ use crate::fec::crc::{crc8, crc16};
 /// Bytes of the text message at the end of an audio stream's logical frame (§6.5).
 pub const TEXT_MESSAGE_BYTES: usize = 4;
 
-/// Frames per 400 ms super frame of Dream's Opus mode (20 ms packets).
+/// Frames per 400 ms super frame of Dream's Opus mode (20 ms packets); a mode E super
+/// frame of 200 ms has half as many ([`opus_frames_per_super_frame`]).
 pub const OPUS_FRAMES_PER_SUPER_FRAME: usize = 20;
+
+/// Opus packets per audio super frame with robustness mode `mode` (20, or 10 in mode E).
+pub const fn opus_frames_per_super_frame(mode: crate::params::RobustnessMode) -> usize {
+    OPUS_FRAMES_PER_SUPER_FRAME / mode.frames_per_audio_super_frame()
+}
 
 /// Largest xHE-AAC frame: the 6144-bit bit reservoir per channel (§5.3.1.3) for stereo.
 pub const XHE_AAC_MAX_FRAME_BYTES: usize = 2 * 6144 / 8;
@@ -163,7 +169,13 @@ impl AacSuperFrameFormat {
 
     /// Dream's Opus framing in a stream of the given lengths.
     pub fn opus(stream: StreamLengths) -> Self {
-        Self::with_borders(OPUS_FRAMES_PER_SUPER_FRAME, OPUS_FRAMES_PER_SUPER_FRAME, stream)
+        Self::opus_frames(OPUS_FRAMES_PER_SUPER_FRAME, stream)
+    }
+
+    /// Dream's Opus framing with `num_frames` packets (10 in mode E's 200 ms super
+    /// frames).
+    pub fn opus_frames(num_frames: usize, stream: StreamLengths) -> Self {
+        Self::with_borders(num_frames, num_frames, stream)
     }
 
     fn with_borders(num_frames: usize, num_borders: usize, stream: StreamLengths) -> Self {
@@ -605,43 +617,117 @@ enum Deframer {
 
 /// Splits the logical frames of one audio service into audio frames and text message
 /// pieces, according to its SDC audio parameters and stream lengths.
+///
+/// In robustness mode E an audio super frame spans two logical frames (§5.2): the one
+/// that went out with an even frame of the transmission super frame (FAC toggle flag 0)
+/// holds its first half, the next one the second; each logical frame carries its own
+/// four text message bytes (§6.5).
 #[derive(Debug, Clone)]
 pub struct AudioDeframer {
     deframer: Deframer,
     text_flag: bool,
     nominal_frames: Option<usize>,
+    /// Logical frames per audio super frame (1, mode E 2).
+    halves: usize,
+    /// Mode E: the first half of the audio super frame being collected.
+    first_half: Option<Vec<u8>>,
+    /// Mode E without frame positions: the next logical frame is a first half.
+    expect_first: bool,
 }
 
 impl AudioDeframer {
     /// `stream` = lengths of the stream carrying the audio (from the multiplex
-    /// description).
+    /// description); robustness modes A–D.
     pub fn new(params: &AudioParams, stream: StreamLengths) -> Result<Self, AudioError> {
+        Self::for_mode(params, stream, crate::params::RobustnessMode::B)
+    }
+
+    /// The deframer for robustness mode `mode` (mode E has its own AAC sampling rates,
+    /// 10 Opus packets and two logical frames per super frame).
+    pub fn for_mode(
+        params: &AudioParams,
+        stream: StreamLengths,
+        mode: crate::params::RobustnessMode,
+    ) -> Result<Self, AudioError> {
         let (deframer, nominal_frames) = match params.codec {
             AudioCodec::Aac => {
-                let n = params
-                    .aac_frames_per_super_frame()
-                    .ok_or(AudioError::Unsupported("AAC sampling rate not allowed in robustness modes A-D"))?;
+                let n = params.aac_frames_per_super_frame_in(mode).ok_or(AudioError::Unsupported(
+                    if mode.is_drm_plus() {
+                        "AAC sampling rate not allowed in robustness mode E"
+                    } else {
+                        "AAC sampling rate not allowed in robustness modes A-D"
+                    },
+                ))?;
                 (Deframer::Aac(AacSuperFrameFormat::aac(n, stream)), Some(n))
             }
-            AudioCodec::Opus => (Deframer::Aac(AacSuperFrameFormat::opus(stream)), Some(OPUS_FRAMES_PER_SUPER_FRAME)),
+            AudioCodec::Opus => {
+                let n = opus_frames_per_super_frame(mode);
+                (Deframer::Aac(AacSuperFrameFormat::opus_frames(n, stream)), Some(n))
+            }
             AudioCodec::XheAac => (Deframer::Xhe(XheAacDeframer::new()), None),
             AudioCodec::Dac | AudioCodec::Encodec => (Deframer::Whole, Some(1)),
             AudioCodec::Reserved => return Err(AudioError::Unsupported("reserved audio coding")),
         };
-        Ok(Self { deframer, text_flag: params.text_flag, nominal_frames })
+        Ok(Self {
+            deframer,
+            text_flag: params.text_flag,
+            nominal_frames,
+            halves: mode.frames_per_audio_super_frame(),
+            first_half: None,
+            expect_first: true,
+        })
     }
 
-    /// Forget state carried between super frames (xHE-AAC).
+    /// Forget state carried between super frames (xHE-AAC; mode E's first half).
     pub fn reset(&mut self) {
         if let Deframer::Xhe(x) = &mut self.deframer {
             x.reset();
         }
+        self.first_half = None;
+        self.expect_first = true;
     }
 
     /// Process the logical frame (part A + part B bytes) of one multiplex frame.
     pub fn push(&mut self, logical_frame: &[u8]) -> AudioSuperFrame {
-        let (sf, text) = split_text_message(logical_frame, self.text_flag);
-        let mut out = AudioSuperFrame { nominal_frames: self.nominal_frames, text, ..Default::default() };
+        self.push_at(logical_frame, None)
+    }
+
+    /// [`Self::push`] for a logical frame that went out with frame `position` of its
+    /// transmission super frame (`MscFrame::position`), which tells mode E's halves
+    /// apart; without it they are taken to alternate.
+    pub fn push_at(&mut self, logical_frame: &[u8], position: Option<usize>) -> AudioSuperFrame {
+        if self.halves == 1 {
+            let (sf, text) = split_text_message(logical_frame, self.text_flag);
+            let mut out = self.deframe(sf);
+            out.text = text;
+            return out;
+        }
+        let first = position.map_or(self.expect_first, |p| p % 2 == 0);
+        self.expect_first = !first;
+        let (half, text) = split_text_message(logical_frame, self.text_flag);
+        if first {
+            // The first half alone: its text piece, nothing to decode yet.
+            self.first_half = Some(half.to_vec());
+            return AudioSuperFrame { nominal_frames: self.nominal_frames, text, ..Default::default() };
+        }
+        let Some(mut sf) = self.first_half.take() else {
+            // The first half was lost, and with it the super frame.
+            return AudioSuperFrame {
+                nominal_frames: self.nominal_frames,
+                text,
+                error: Some(AudioError::TooShort(half.len())),
+                ..Default::default()
+            };
+        };
+        sf.extend_from_slice(half);
+        let mut out = self.deframe(&sf);
+        out.text = text;
+        out
+    }
+
+    /// Split a whole audio super frame into its frames.
+    fn deframe(&mut self, sf: &[u8]) -> AudioSuperFrame {
+        let mut out = AudioSuperFrame { nominal_frames: self.nominal_frames, ..Default::default() };
         let result = match &mut self.deframer {
             Deframer::Aac(fmt) => parse_aac_super_frame(sf, fmt),
             Deframer::Xhe(x) => x.push(sf).map(|(h, frames)| {
@@ -661,6 +747,12 @@ impl AudioDeframer {
     pub fn push_frame(&mut self, frame: &LogicalFrame) -> AudioSuperFrame {
         self.push(&frame.data)
     }
+
+    /// [`Self::push_at`] for a demultiplexed [`LogicalFrame`].
+    pub fn push_frame_at(&mut self, frame: &LogicalFrame, position: Option<usize>) -> AudioSuperFrame {
+        self.push_at(&frame.data, position)
+    }
+
 }
 
 #[cfg(test)]

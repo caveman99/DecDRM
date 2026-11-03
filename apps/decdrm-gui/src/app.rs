@@ -141,6 +141,9 @@ impl DecDrmApp {
         if args.iq_swapped {
             settings.format = SignalFormat::IqSwapped;
         }
+        if args.drm_plus {
+            settings.drm_plus = true;
+        }
         let mut tx_page = TxPage::new(&mut settings, tx_config::example_dir(store.path()));
         if let Some(station) = &args.station {
             tx_page.open_file(&mut settings, station);

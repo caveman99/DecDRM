@@ -8,27 +8,28 @@
 //! SDC data ─▶ block (AFS, CRC) ─▶ MLC encoder ─┘
 //! ```
 //!
-//! [`Transmitter::transmit_frame`] produces one transmission frame (400 ms,
-//! 19 200 complex samples at 48 kHz) per call, with the DRM DC carrier at 0 Hz.
+//! [`Transmitter::transmit_frame`] produces one transmission frame (400 ms at 48 kHz,
+//! mode E 100 ms at 192 kHz: 19 200 complex samples either way) per call, with the DRM
+//! DC carrier at 0 Hz.
 //! [`output::OutputStage`] turns that into real IF or I/Q samples for a sound card
 //! or file, and [`crate::channel`] can impair it for loopback tests.
 //!
 //! # Frame structure (ES 201 980 §7.7, §8.4)
 //!
-//! * Three transmission frames form a super frame. The transmitter starts at the
-//!   first frame of a super frame and sets the FAC frame index itself.
-//! * The SDC block (one per super frame) occupies the first 2 (modes A, B) or 3
-//!   (modes C, D) symbols of the super frame.
-//! * Every frame carries one FAC block (65 cells).
-//! * The MSC cells of a super frame (all remaining data cells) carry three multiplex
-//!   frames of N_MUX cells each, in order, followed by 0–2 dummy cells. Multiplex
+//! * Three transmission frames (four in mode E) form a super frame. The transmitter
+//!   starts at the first frame of a super frame and sets the FAC frame index itself.
+//! * The SDC block (one per super frame) occupies the first 2 (modes A, B), 3
+//!   (modes C, D) or 5 (mode E) symbols of the super frame.
+//! * Every frame carries one FAC block (65 cells, mode E 244).
+//! * The MSC cells of a super frame (all remaining data cells) carry three (mode E:
+//!   four) multiplex frames of N_MUX cells each, in order, followed by 0–2 dummy cells. Multiplex
 //!   frames are therefore *not* aligned with transmission frames; the transmitter
 //!   buffers the interleaved cells of the multiplex frame supplied with each call
 //!   and maps them as the super frame progresses. (Frame 0 has fewer MSC cells than
 //!   N_MUX because of the SDC, so the multiplex frame supplied with a call is always
 //!   available when its first cells are needed.)
 //! * MSC cell interleaving (§7.6) delays cell i of a multiplex frame by `i mod D`
-//!   frames (D = 5 for long, 1 for short interleaving). The interleaver starts
+//!   frames (D = 5 for long, 1 for short interleaving, 6 in mode E). The interleaver starts
 //!   primed with encoded all-zero multiplex frames, so the cells sent during the
 //!   first D − 1 frames are valid constellation points. Together with the receiver's
 //!   deinterleaver the end-to-end delay is D − 1 multiplex frames.
@@ -43,10 +44,8 @@ use crate::cellmap::CellMap;
 use crate::fac::{Fac, Interleaving, MscMode, SdcMode};
 use crate::fec::mlc::{MlcEncoder, MlcParams, MscProtection, check_params};
 use crate::interleave::CellInterleaver;
-use crate::params::{
-    ChannelLayout, FRAMES_PER_SUPERFRAME, RobustnessMode, SAMPLES_PER_FRAME, SpectrumOccupancy,
-};
-use crate::tables::{DUMMY_CELL_16QAM, DUMMY_CELL_64QAM, NUM_FAC_CELLS};
+use crate::params::{ChannelLayout, RobustnessMode, SAMPLES_PER_FRAME, SpectrumOccupancy};
+use crate::tables::{DUMMY_CELL_4QAM, DUMMY_CELL_16QAM, DUMMY_CELL_64QAM, num_fac_cells};
 use ofdm::OfdmModulator;
 use std::collections::VecDeque;
 
@@ -57,6 +56,8 @@ use std::collections::VecDeque;
 pub enum TxError {
     #[error("robustness mode {mode} is not defined with spectrum occupancy {occupancy}")]
     InvalidLayout { mode: RobustnessMode, occupancy: SpectrumOccupancy },
+    #[error("robustness mode {mode} has no {what}")]
+    NotInMode { mode: RobustnessMode, what: &'static str },
     #[error("{what} protection level {level} is out of range (maximum {max})")]
     InvalidProtection { what: &'static str, level: usize, max: usize },
     #[error("a higher protected part of {bytes} bytes does not fit into the multiplex frame")]
@@ -84,8 +85,8 @@ pub struct TxConfig {
     pub msc_mode: MscMode,
     pub sdc_mode: SdcMode,
     pub interleaving: Interleaving,
-    /// Protection levels of parts A and B (0..=1 for 16-QAM, 0..=3 for 64-QAM) and of
-    /// the hierarchical part (0..=3, used by HMsym/HMmix only).
+    /// Protection levels of parts A and B (0..=1 for 16-QAM, 0..=3 for 64-QAM and in
+    /// mode E) and of the hierarchical part (0..=3, used by HMsym/HMmix only).
     pub protection: MscProtection,
     /// Length of the higher protected part (sum over all streams) in bytes per
     /// multiplex frame; 0 = equal error protection.
@@ -174,7 +175,17 @@ impl Transmitter {
         if cfg.afs_index > 15 {
             return Err(TxError::InvalidAfsIndex(cfg.afs_index));
         }
-        let max_level = if cfg.msc_mode == MscMode::Qam16Sm { 1 } else { 3 };
+        let mode = cfg.mode;
+        if !cfg.msc_mode.allowed_in(mode) {
+            return Err(TxError::NotInMode { mode, what: "such MSC constellation" });
+        }
+        if !cfg.sdc_mode.allowed_in(mode) {
+            return Err(TxError::NotInMode { mode, what: "such SDC mode" });
+        }
+        if mode.is_drm_plus() && cfg.interleaving == Interleaving::Short {
+            return Err(TxError::NotInMode { mode, what: "short interleaving" });
+        }
+        let max_level = cfg.msc_mode.max_protection_level(mode);
         let p = cfg.protection;
         for (what, level, max) in
             [("part A", p.part_a, max_level), ("part B", p.part_b, max_level), ("hierarchical", p.hierarchical, 3)]
@@ -185,22 +196,19 @@ impl Transmitter {
         }
 
         let msc_params =
-            MlcParams::msc(cfg.msc_mode.mapping(), map.msc_cells_per_frame, cfg.protection, cfg.part_a_bytes);
+            MlcParams::msc(mode, cfg.msc_mode.mapping(), map.msc_cells_per_frame, cfg.protection, cfg.part_a_bytes);
         // `MlcParams::msc` silently falls back to EEP when part A does not fit.
         if cfg.part_a_bytes > 0 && msc_params.n1 == 0 {
             return Err(TxError::PartATooLong { bytes: cfg.part_a_bytes });
         }
-        let sdc_params = MlcParams::sdc(cfg.sdc_mode.mapping(), map.sdc_cells_per_superframe);
-        let fac_params = MlcParams::fac();
+        let sdc_params = cfg.sdc_mode.mlc_params(map.sdc_cells_per_superframe);
+        let fac_params = MlcParams::fac(mode);
         for params in [&msc_params, &sdc_params, &fac_params] {
             // `map_err` converts the `Err(String)` into our error type; `?` returns it.
             check_params(params).map_err(TxError::Mlc)?;
         }
 
-        let depth = match cfg.interleaving {
-            Interleaving::Long => 5,
-            Interleaving::Short => 1,
-        };
+        let depth = cfg.interleaving.depth(mode);
         let msc_enc = MlcEncoder::new(msc_params);
         let mut interleaver = CellInterleaver::new(map.msc_cells_per_frame, depth);
         // Prime the interleaver memory with an encoded all-zero multiplex frame.
@@ -211,6 +219,7 @@ impl Transmitter {
         }
 
         let d = match cfg.msc_mode {
+            MscMode::Qam4 => DUMMY_CELL_4QAM,
             MscMode::Qam16Sm => DUMMY_CELL_16QAM,
             _ => DUMMY_CELL_64QAM,
         };
@@ -232,7 +241,7 @@ impl Transmitter {
             // Dream's cDummyCells{16,64}QAM: (1 + j)·a, (1 − j)·a with a the innermost
             // PAM amplitude (§7.7).
             dummy: [Cplx::new(d, d), Cplx::new(d, -d)],
-            fac_cells: Vec::with_capacity(NUM_FAC_CELLS),
+            fac_cells: Vec::with_capacity(num_fac_cells(mode)),
             msc_cells: Vec::new(),
             symbol: vec![Cplx::new(0.0, 0.0); map.num_carriers],
             map,
@@ -274,13 +283,15 @@ impl Transmitter {
         self.sdc_data.len()
     }
 
-    /// MSC cell interleaver depth D in multiplex frames (5 long, 1 short). The
-    /// end-to-end delay through transmitter and receiver is D − 1 multiplex frames.
+    /// MSC cell interleaver depth D in multiplex frames (5 long, 1 short, 6 in mode
+    /// E). The end-to-end delay through transmitter and receiver is D − 1 multiplex
+    /// frames.
     pub fn interleaver_depth(&self) -> usize {
         self.depth
     }
 
-    /// Index (0..=2) within its super frame of the frame the next call produces.
+    /// Index (0..=2, mode E 0..=3) within its super frame of the frame the next call
+    /// produces.
     pub fn frame_index(&self) -> usize {
         self.frame_index
     }
@@ -304,10 +315,12 @@ impl Transmitter {
     }
 
     /// The FAC exactly as it will be sent in the next frame: the caller's FAC with
-    /// the frame index and the transmission parameters (occupancy, interleaving,
-    /// MSC and SDC mode) taken from the transmitter. The AFS-valid flag is kept for
-    /// the first frame of a super frame and cleared otherwise (or both follow
-    /// [`Self::set_fixed_fac_identity`]).
+    /// the frame index and the transmission parameters (RM flag, occupancy,
+    /// interleaving, MSC and SDC mode, mode E's toggle flag) taken from the transmitter.
+    /// The AFS-valid flag is kept for the first frame of a super frame and cleared
+    /// otherwise (or both follow [`Self::set_fixed_fac_identity`]). In mode E a missing
+    /// second set of service parameters repeats the first; in modes A–D a second set is
+    /// dropped.
     pub fn fac_for_next_frame(&self, fac: &Fac) -> Fac {
         // `Fac` is `Copy`, so `*fac` makes a copy we can modify.
         let mut f = *fac;
@@ -319,15 +332,19 @@ impl Transmitter {
             ch.frame_index = if id == 3 { 0 } else { id };
             ch.afs_valid = id == 0;
         }
+        let mode_e = self.cfg.mode.is_drm_plus();
+        ch.mode_e = mode_e;
+        ch.toggle = mode_e && ch.frame_index % 2 == 1;
         ch.occupancy = self.cfg.occupancy;
         ch.interleaving = self.cfg.interleaving;
         ch.msc_mode = self.cfg.msc_mode;
         ch.sdc_mode = self.cfg.sdc_mode;
+        f.service2 = mode_e.then(|| fac.service2.unwrap_or(fac.service));
         f
     }
 
     /// Produce the next transmission frame: [`SAMPLES_PER_FRAME`] complex baseband
-    /// samples at 48 kHz.
+    /// samples at the mode's working rate (48 kHz, mode E 192 kHz).
     ///
     /// * `fac` — FAC content; see [`Self::fac_for_next_frame`] for the fields the
     ///   transmitter overrides.
@@ -389,7 +406,8 @@ impl Transmitter {
 
         // Cell mapping and OFDM modulation (Dream's `COFDMCellMapping`).
         let ns = self.map.symbols_per_frame;
-        let useful = FRAMES_PER_SUPERFRAME * self.map.msc_cells_per_frame;
+        let frames = self.map.frames_per_superframe();
+        let useful = frames * self.map.msc_cells_per_frame;
         let (mut next_fac, mut next_sdc, mut next_dummy) = (0usize, 0usize, 0usize);
         out.reserve(ns * self.ofdm.symbol_len());
         for s in 0..ns {
@@ -420,10 +438,10 @@ impl Transmitter {
             }
             self.ofdm.modulate(&self.symbol, out);
         }
-        debug_assert_eq!(next_fac, NUM_FAC_CELLS);
+        debug_assert_eq!(next_fac, num_fac_cells(self.cfg.mode));
         debug_assert!(self.frame_index != 0 || next_sdc == self.sdc_cells.len());
 
-        self.frame_index = (self.frame_index + 1) % FRAMES_PER_SUPERFRAME;
+        self.frame_index = (self.frame_index + 1) % frames;
         self.frames_sent += 1;
         Ok(())
     }
@@ -443,6 +461,7 @@ mod tests {
         Fac {
             channel: ChannelParams {
                 enhancement: false,
+                mode_e: false,
                 frame_index: 0,
                 afs_valid: false,
                 occupancy: SpectrumOccupancy::SO_3,
@@ -463,6 +482,7 @@ mod tests {
                 descriptor: 10,
                 data_ca: false,
             },
+            service2: None,
         }
     }
 
@@ -482,7 +502,7 @@ mod tests {
         let mode = map.mode();
         let (n, g, ns) = (mode.fft_size(), mode.guard_len(), map.symbols_per_frame);
         let mut fft = Fft::new(n);
-        let mut fac_dec = MlcDecoder::new(MlcParams::fac(), 0);
+        let mut fac_dec = MlcDecoder::new(MlcParams::fac(mode), 0);
         let mut sdc_dec = MlcDecoder::new(tx.sdc_enc.params().clone(), 1);
         let mut msc_dec = MlcDecoder::new(tx.msc_enc.params().clone(), 1);
         let mut deint = CellDeinterleaver::new(map.msc_cells_per_frame, tx.interleaver_depth());
@@ -521,7 +541,7 @@ mod tests {
                 sdc.clear();
             }
             for &c in map.msc_carriers(sf_sym) {
-                if msc_count < 3 * map.msc_cells_per_frame {
+                if msc_count < map.frames_per_superframe() * map.msc_cells_per_frame {
                     msc.push(eq(cells[c as usize]));
                     if msc.len() == map.msc_cells_per_frame {
                         let d = deint.push(&msc).unwrap();
@@ -565,9 +585,11 @@ mod tests {
         }
         let dec = ideal_receive(&tx, &signal);
         assert_eq!(dec.facs, sent_fac, "{cfg:?}");
+        let frames_per_sf = cfg.mode.frames_per_superframe();
         for (i, fac) in dec.facs.iter().enumerate() {
-            assert_eq!(fac.channel.frame_index as usize, i % 3);
-            assert_eq!(fac.channel.afs_valid, i % 3 == 0);
+            assert_eq!(fac.channel.frame_index as usize, i % frames_per_sf);
+            assert_eq!(fac.channel.afs_valid, i % frames_per_sf == 0);
+            assert_eq!(fac.channel.mode_e, cfg.mode.is_drm_plus());
         }
         assert_eq!(dec.sdc_blocks.len(), sent_sdc.len());
         for (bits, data) in dec.sdc_blocks.iter().zip(&sent_sdc) {
@@ -602,8 +624,33 @@ mod tests {
         }
     }
 
+    /// Mode E: both MSC constellations, both SDC modes, UEP, the 600 ms interleaver.
+    #[test]
+    fn ideal_loopback_mode_e() {
+        for (i, (msc_mode, sdc_mode)) in
+            [(MscMode::Qam4, SdcMode::Qam4), (MscMode::Qam16Sm, SdcMode::Qam4Robust)].into_iter().enumerate()
+        {
+            let cfg = TxConfig {
+                mode: RobustnessMode::E,
+                occupancy: SpectrumOccupancy::SO_0,
+                msc_mode,
+                sdc_mode,
+                interleaving: Interleaving::Long,
+                protection: MscProtection { part_a: 3 - i, part_b: 1 + i, hierarchical: 0 },
+                part_a_bytes: 120 * i,
+                afs_index: 2,
+            };
+            let tx = Transmitter::new(cfg).unwrap();
+            assert_eq!(tx.interleaver_depth(), 6);
+            run_ideal_loopback(cfg, 16);
+        }
+        let short = TxConfig { mode: RobustnessMode::E, occupancy: SpectrumOccupancy::SO_0, ..Default::default() };
+        assert!(matches!(Transmitter::new(short), Err(TxError::NotInMode { .. })));
+    }
+
     #[test]
     fn ideal_loopback_all_msc_modes() {
+
         let modes = [MscMode::Qam16Sm, MscMode::Qam64Sm, MscMode::Qam64HmSym, MscMode::Qam64HmMix];
         for (i, msc_mode) in modes.into_iter().enumerate() {
             for interleaving in [Interleaving::Short, Interleaving::Long] {

@@ -46,7 +46,7 @@ use std::path::PathBuf;
 #[command(
     name = "decdrm-gui",
     version,
-    about = "DecDRM — Digital Radio Mondiale (DRM30) receiver and transmitter"
+    about = "DecDRM — Digital Radio Mondiale (DRM30 and DRM+) receiver and transmitter"
 )]
 pub struct Args {
     /// Recording to open (WAV/FLAC). Files with an `IQ` token in the name open as I/Q.
@@ -57,6 +57,9 @@ pub struct Args {
     /// Treat the input as I/Q with I on the right channel.
     #[arg(long)]
     pub iq_swapped: bool,
+    /// Receive DRM+ (robustness mode E, 100 kHz, 192 kHz input) instead of DRM30.
+    #[arg(long)]
+    pub drm_plus: bool,
     /// Start receiving right away.
     #[arg(long)]
     pub start: bool,

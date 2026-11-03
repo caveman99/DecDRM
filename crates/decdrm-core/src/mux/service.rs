@@ -316,12 +316,21 @@ impl AudioParams {
     /// Number of AAC frames per 400 ms audio super frame in robustness modes A–D
     /// (§5.4.1): 5 at 12 kHz, 10 at 24 kHz. `None` for other rates or codecs.
     pub fn aac_frames_per_super_frame(&self) -> Option<usize> {
+        self.aac_frames_per_super_frame_in(crate::params::RobustnessMode::B)
+    }
+
+    /// Number of AAC frames per audio super frame with robustness mode `mode` (§5.4.1,
+    /// table 10): 5 at 12 kHz and 10 at 24 kHz in modes A–D (400 ms), 5 at 24 kHz and 10
+    /// at 48 kHz in mode E (200 ms). `None` for other rates or codecs.
+    pub fn aac_frames_per_super_frame_in(&self, mode: crate::params::RobustnessMode) -> Option<usize> {
+        let (five, ten) = if mode.is_drm_plus() { (24_000, 48_000) } else { (12_000, 24_000) };
         match (self.codec, self.sample_rate_hz) {
-            (AudioCodec::Aac, 12_000) => Some(5),
-            (AudioCodec::Aac, 24_000) => Some(10),
+            (AudioCodec::Aac, r) if r == five => Some(5),
+            (AudioCodec::Aac, r) if r == ten => Some(10),
             _ => None,
         }
     }
+
 
     /// Nominal output sampling rate of the decoder: AAC's core rate, doubled by SBR; the
     /// signalled rate itself for the other codecs (xHE-AAC signals its output rate).
@@ -815,21 +824,24 @@ impl Ensemble {
         self.last_reconfiguration_index = ri;
         self.channel = Some(c);
 
-        let s = fac.service;
-        let i = usize::from(s.short_id & 3);
-        let svc = &mut self.services[i];
-        if svc.fac.map(|f| f.service_id) != Some(s.service_id) && svc.fac.is_some() {
-            // A different service now uses this Short Id: its SDC data is stale.
-            svc.clear_sdc();
-            ch.labels |= 1 << i;
-            ch.audio |= 1 << i;
-            ch.data |= 1 << i;
+        // Mode E blocks carry a second set of service parameters (§6.3.2).
+        for s in std::iter::once(fac.service).chain(fac.service2) {
+            let i = usize::from(s.short_id & 3);
+            let svc = &mut self.services[i];
+            if svc.fac.map(|f| f.service_id) != Some(s.service_id) && svc.fac.is_some() {
+                // A different service now uses this Short Id: its SDC data is stale.
+                svc.clear_sdc();
+                ch.labels |= 1 << i;
+                ch.audio |= 1 << i;
+                ch.data |= 1 << i;
+            }
+            if svc.fac != Some(s) {
+                svc.fac = Some(s);
+                ch.services |= 1 << i;
+            }
+            self.fac_seen[i] = Some(self.fac_count);
         }
-        if svc.fac != Some(s) {
-            svc.fac = Some(s);
-            ch.services |= 1 << i;
-        }
-        self.fac_seen[i] = Some(self.fac_count);
+
 
         // More services known than the FAC announces (a false FAC CRC match, or services
         // removed by a reconfiguration): forget the least recently signalled ones. Dream
@@ -1087,6 +1099,7 @@ mod tests {
         Fac {
             channel: ChannelParams {
                 enhancement: false,
+                mode_e: false,
                 frame_index: 0,
                 afs_valid: false,
                 occupancy: SpectrumOccupancy::SO_3,
@@ -1107,6 +1120,7 @@ mod tests {
                 descriptor: if short_id == 1 { 5 } else { 10 },
                 data_ca: false,
             },
+            service2: None,
         }
     }
 
